@@ -39,6 +39,18 @@ void lv_runtime_destroy(lv_runtime_t *rt) {
      * which is freed separately. We don't free them here to avoid
      * double-free. */
     if (rt->protos) lv_free(rt->protos);
+    /* Free compiled bytecode modules (owned by the runtime). */
+    if (rt->proto_bytecode) {
+        for (int i = 0; i < rt->nproto_bytecode; i++) {
+            if (rt->proto_bytecode[i]) {
+                vtx_bytecode_t *bc = rt->proto_bytecode[i];
+                if (bc->code) lv_free((void *)bc->code);
+                if (bc->constant_pool) lv_free(bc->constant_pool);
+                lv_free(bc);
+            }
+        }
+        lv_free(rt->proto_bytecode);
+    }
     /* Free globals table. */
     if (rt->globals) lv_table_free(rt->globals);
     if (rt->error_msg) lv_free(rt->error_msg);
@@ -113,7 +125,30 @@ vtx_value_t lv_runtime_create_closure(lv_runtime_t *rt, int proto_id) {
         return VTX_VALUE_NULL;
     }
     lv_function_t *f = lv_function_new_lua(proto_id);
+    f->rt = rt;
     return lv_make_function_val(f);
+}
+
+/* Associate compiled bytecode with a proto. Grows the table as needed. */
+void lv_runtime_set_proto_bytecode(lv_runtime_t *rt, int proto_id, vtx_bytecode_t *bc) {
+    if (proto_id < 0) return;
+    /* Grow the array if needed (sparse; indexed by proto_id). */
+    if (proto_id >= rt->cap_proto_bytecode) {
+        int new_cap = rt->cap_proto_bytecode ? rt->cap_proto_bytecode : 16;
+        while (new_cap <= proto_id) new_cap *= 2;
+        rt->proto_bytecode = lv_realloc(rt->proto_bytecode, sizeof(vtx_bytecode_t *) * new_cap);
+        for (int i = rt->cap_proto_bytecode; i < new_cap; i++) {
+            rt->proto_bytecode[i] = NULL;
+        }
+        rt->cap_proto_bytecode = new_cap;
+    }
+    if (proto_id >= rt->nproto_bytecode) rt->nproto_bytecode = proto_id + 1;
+    rt->proto_bytecode[proto_id] = bc;
+}
+
+vtx_bytecode_t *lv_runtime_get_proto_bytecode(lv_runtime_t *rt, int proto_id) {
+    if (proto_id < 0 || proto_id >= rt->nproto_bytecode) return NULL;
+    return rt->proto_bytecode[proto_id];
 }
 
 /* ---- Lua function call ----
@@ -141,15 +176,45 @@ vtx_value_t lv_runtime_call(lv_runtime_t *rt, vtx_value_t fn_val,
         lv_eval_set_runtime(rt);
         return fn->u.native.fn(nargs, args, fn->u.native.user_data);
     }
-    /* Lua closure: evaluate the proto's body via the tree-walker. */
+    /* Lua closure. Prefer compiled bytecode if available. */
     int proto_id = fn->u.proto_id;
     if (proto_id < 0 || proto_id >= rt->nprotos) {
         lv_error(rt, "invalid function prototype id %d", proto_id);
         return VTX_VALUE_NULL;
     }
     lv_func_proto_t *proto = rt->protos[proto_id];
-    /* Use the function's captured enclosing scope (for closures and
-     * recursive local functions). */
+
+    /* If we have compiled bytecode, run it on the VORTEX runtime. */
+    vtx_bytecode_t *bc = (fn->compiled_bc) ? fn->compiled_bc
+                       : lv_runtime_get_proto_bytecode(rt, proto_id);
+    if (bc) {
+        /* Create a new scope table for this invocation, with __parent
+         * set to the closure's captured env (or the global env). */
+        lv_table_t *scope = lv_table_new(8);
+        vtx_value_t parent_key = lv_runtime_intern_string(rt, "__parent", 8);
+        vtx_value_t parent_val = fn->captured_env
+            ? lv_make_table_val(fn->captured_env)
+            : lv_make_table_val(rt->current_env);
+        lv_table_set(scope, parent_key, parent_val);
+
+        /* Bind parameters into the scope table. */
+        for (int i = 0; i < proto->nparams && i < nargs; i++) {
+            vtx_value_t pname = lv_runtime_intern_string(rt, proto->params[i],
+                                                          strlen(proto->params[i]));
+            lv_table_set(scope, pname, args[i]);
+        }
+
+        /* Run the bytecode with the scope table as local 0. */
+        vtx_value_t scope_val = lv_make_table_val(scope);
+        lv_runtime_t *prev_rt = g_lv_runtime;
+        g_lv_runtime = rt;
+        lv_eval_set_runtime(rt);
+        vtx_value_t result = vtx_runtime_run_with_args(&rt->vrt, bc, &scope_val, 1);
+        g_lv_runtime = prev_rt;
+        return result;
+    }
+
+    /* Fallback: tree-walker (deprecated path, kept for safety). */
     return lv_runtime_eval_proto_scope(rt, proto, args, nargs, fn->enclosing_scope);
 }
 

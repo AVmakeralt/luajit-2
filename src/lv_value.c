@@ -44,6 +44,8 @@ lv_function_t *lv_function_new_lua(int proto_id) {
     f->nupvalues = 0;
     f->enclosing_scope = NULL;
     f->rt = NULL;
+    f->captured_env = NULL;
+    f->compiled_bc = NULL;
     return f;
 }
 
@@ -59,6 +61,8 @@ lv_function_t *lv_function_new_native(vtx_value_t (*fn)(int, vtx_value_t *, void
     f->nupvalues = 0;
     f->enclosing_scope = NULL;
     f->rt = NULL;
+    f->captured_env = NULL;
+    f->compiled_bc = NULL;
     return f;
 }
 

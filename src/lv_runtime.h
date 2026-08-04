@@ -35,6 +35,12 @@ typedef struct lv_runtime {
     int              nprotos;
     int              cap_protos;
 
+    /* Compiled bytecode modules for each registered proto. The codegen
+     * populates this as it compiles function bodies. */
+    vtx_bytecode_t **proto_bytecode;
+    int              nproto_bytecode;
+    int              cap_proto_bytecode;
+
     /* The global environment. This is a Lua table that holds all
      * global variables and stdlib functions. */
     lv_table_t      *globals;
@@ -72,6 +78,12 @@ vtx_value_t lv_runtime_intern_string(lv_runtime_t *rt, const char *data, size_t 
  * Register a function prototype with the runtime. Returns a unique ID
  * that can be used to create closures via lv_runtime_create_closure. */
 int lv_runtime_register_proto(lv_runtime_t *rt, lv_func_proto_t *proto);
+
+/* Associate a compiled VORTEX bytecode module with a registered proto. */
+void lv_runtime_set_proto_bytecode(lv_runtime_t *rt, int proto_id, vtx_bytecode_t *bc);
+
+/* Get the compiled bytecode for a proto (or NULL if not compiled). */
+vtx_bytecode_t *lv_runtime_get_proto_bytecode(lv_runtime_t *rt, int proto_id);
 
 /* Create a Lua closure for a registered prototype. */
 vtx_value_t lv_runtime_create_closure(lv_runtime_t *rt, int proto_id);

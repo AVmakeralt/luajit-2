@@ -75,12 +75,15 @@ typedef struct lv_function {
     vtx_value_t *upvalues;
     int          nupvalues;
     /* The enclosing scope (for recursive local functions and closures).
-     * Set when the function is created; used as the parent scope when
-     * the function is called. NULL for top-level functions (which use
-     * the global env). */
+     * Used by the tree-walker (kept for backward compat; compiled
+     * closures use captured_env instead). */
     struct lv_eval_scope *enclosing_scope;
     /* The runtime pointer (so the function can be called from any context). */
     struct lv_runtime *rt;
+    /* Compiled closure: captured environment table (a Lua table). */
+    lv_table_t *captured_env;
+    /* Compiled closure: pointer to the compiled VORTEX bytecode. */
+    vtx_bytecode_t *compiled_bc;
 } lv_function_t;
 
 /* ---- Constructors ---- */

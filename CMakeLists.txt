@@ -39,8 +39,15 @@ set(VORTEX_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(VORTEX_ENABLE_SOTA ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/VORTEX)
 
-# LuaVortex sources.
-set(LV_SOURCES
+# LuaVortex include paths.
+set(LV_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/VORTEX/src
+    ${CMAKE_CURRENT_BINARY_DIR}/vendor/VORTEX
+)
+
+# LuaVortex library sources (everything except main).
+set(LV_LIB_SOURCES
     src/lv_lexer.c
     src/lv_ast.c
     src/lv_parser.c
@@ -49,18 +56,14 @@ set(LV_SOURCES
     src/lv_runtime.c
     src/lv_stdlib.c
     src/lv_eval.c
-    src/lv_main.c
 )
 
-add_executable(luavortex ${LV_SOURCES})
-target_include_directories(luavortex PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/VORTEX/src
-    ${CMAKE_CURRENT_BINARY_DIR}/vendor/VORTEX
-)
+# Build a static library so tests and the CLI both link against it.
+add_library(luavortex_lib STATIC ${LV_LIB_SOURCES})
+target_include_directories(luavortex_lib PUBLIC ${LV_INCLUDE_DIRS})
 
-# Link against all VORTEX static libraries.
-target_link_libraries(luavortex PRIVATE
+# Link the VORTEX libraries into luavortex_lib (PUBLIC so consumers inherit).
+target_link_libraries(luavortex_lib PUBLIC
     -Wl,--start-group
     vortex_runtime
     vortex_interp
@@ -84,6 +87,10 @@ target_link_libraries(luavortex PRIVATE
     pthread
 )
 
+# Main executable.
+add_executable(luavortex src/lv_main.c)
+target_link_libraries(luavortex PRIVATE luavortex_lib)
+
 # Install (optional).
 install(TARGETS luavortex DESTINATION bin)
 
@@ -93,8 +100,6 @@ file(GLOB LV_TEST_SOURCES tests/*.c)
 foreach(test_src ${LV_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
-    target_link_libraries(${test_name} PRIVATE
-        luavortex
-    )
+    target_link_libraries(${test_name} PRIVATE luavortex_lib)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

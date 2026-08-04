@@ -93,9 +93,7 @@ typedef enum {
     LV_FN_STR_CHAR    = 157,
     LV_FN_STR_FORMAT  = 158,
     LV_FN_STR_FIND    = 159,
-    LV_FN_STR_GSUB    = 160,
-    LV_FN_STR_MATCH   = 161,
-    LV_FN_STR_GMATCH  = 162,
+    /* (string.gmatch/gsub/match are at 250-252, defined later) */
     /* Table operations */
     LV_FN_TBL_INSERT  = 170,
     LV_FN_TBL_REMOVE  = 171,
@@ -137,6 +135,37 @@ typedef enum {
     LV_FN_GLOBAL_GET  = 228,  /* (env, name) → value */
     LV_FN_GLOBAL_SET  = 229,  /* (env, name, value) → nil */
     LV_FN_RETURN_MULTI= 230,  /* (vals...) → first value (MVP: 1 return) */
+    /* Scope table helpers (for compiled function bodies) */
+    LV_FN_SCOPE_GET   = 240,  /* (scope, name) → value */
+    LV_FN_SCOPE_SET   = 241,  /* (scope, name, value) → nil */
+    LV_FN_SCOPE_DECLARE=242,  /* (scope, name, value) → nil */
+    LV_FN_NEW_SCOPE   = 243,  /* (parent) → new_scope */
+    LV_FN_NEW_CLOSURE_WITH_ENV = 244, /* (proto_id, captured_env) → closure */
+    /* Expanded string library */
+    LV_FN_STR_GMATCH  = 250,
+    LV_FN_STR_GSUB    = 251,
+    LV_FN_STR_MATCH   = 252,
+    /* Expanded math library */
+    LV_FN_MATH_ATAN2  = 260,
+    LV_FN_MATH_ASIN   = 261,
+    LV_FN_MATH_ACOS   = 262,
+    LV_FN_MATH_TANH   = 263,
+    LV_FN_MATH_SINH   = 264,
+    LV_FN_MATH_COSH   = 265,
+    LV_FN_MATH_FMOD   = 266,
+    LV_FN_MATH_TYPE   = 267,
+    LV_FN_MATH_TOINT  = 268,
+    /* Expanded table library */
+    LV_FN_TBL_MOVE    = 270,
+    LV_FN_TBL_PACK    = 271,
+    /* Expanded os library */
+    LV_FN_OS_GETENV   = 280,
+    LV_FN_OS_EXECUTE  = 281,
+    LV_FN_OS_EXIT     = 282,
+    /* Expanded io library */
+    LV_FN_IO_OPEN     = 290,
+    LV_FN_IO_CLOSE    = 291,
+    LV_FN_IO_LINES    = 292,
 } lv_fn_id_t;
 
 /* ---- Internal buffers ---- */
@@ -202,6 +231,10 @@ typedef struct lv_func_cg {
     /* Function semantics */
     bool            is_function;
     bool            is_vararg;
+    /* If true, use scope-table model (all variable accesses go through
+     * SCOPE_GET/SCOPE_SET runtime calls). Used for function bodies.
+     * If false (main chunk), use VORTEX locals directly. */
+    bool            use_scope_table;
     /* Stack tracking */
     int             cur_stack;
     int             max_stack;
@@ -529,8 +562,21 @@ static void compile_literal(lv_func_cg_t *f, lv_node_t *node) {
 }
 
 /* Compile a variable reference (name lookup).
- * Local if found in scope; otherwise global (env.name). */
+ * In scope-table mode (function bodies): always use SCOPE_GET.
+ * In local mode (main chunk): check VORTEX locals first, then global. */
 static void compile_name(lv_func_cg_t *f, lv_node_t *node) {
+    if (f->use_scope_table) {
+        /* Function body: scope_get(local 0, name) */
+        emit_op(f, VT_OP_LOAD_LOCAL);
+        emit_operand16(f, (uint16_t)f->env_slot);
+        push1(f);
+        uint16_t name_idx = const_add_string(f, node->str, strlen(node->str));
+        emit_op(f, VT_OP_LOAD_CONST_STR);
+        emit_operand16(f, name_idx);
+        push1(f);
+        emit_lua_call(f, LV_FN_SCOPE_GET, 2);
+        return;
+    }
     int slot = scope_lookup_local(f, node->str);
     if (slot >= 0) {
         emit_op(f, VT_OP_LOAD_LOCAL);
@@ -600,8 +646,9 @@ static void compile_table_ctor(lv_func_cg_t *f, lv_node_t *node) {
             compile_expr(f, e->children[0]); /* key */
             compile_expr(f, e->children[1]); /* value */
             emit_lua_call(f, LV_FN_SET_FIELD, 3);
-            /* SET_FIELD returns the table; pop it (we already have the
-             * original on the stack). */
+            /* SET_FIELD returns the table; emit a POP to discard it
+             * (we already have the original on the stack). */
+            emit_op(f, VT_OP_POP);
             pop1(f);
         } else {
             /* positional: key = pos_idx */
@@ -613,6 +660,7 @@ static void compile_table_ctor(lv_func_cg_t *f, lv_node_t *node) {
             push1(f);
             compile_expr(f, e); /* value */
             emit_lua_call(f, LV_FN_SET_FIELD, 3);
+            emit_op(f, VT_OP_POP);
             pop1(f);
         }
     }
@@ -861,8 +909,41 @@ static void compile_expr(lv_func_cg_t *f, lv_node_t *node) {
 static void compile_local(lv_func_cg_t *f, lv_node_t *node) {
     /* names[] = children[] (values) */
     int nvals = node->nchildren;
-    /* Evaluate values left-to-right, store in fresh locals. */
-    /* For MVP: each name gets one value (no multi-return adjustment). */
+    if (f->use_scope_table) {
+        /* Function body: declare locals in the scope table.
+         * We need: scope_declare(scope, name, value) with args in order
+         * [scope, name, value] on the stack (value on top). */
+        for (int i = 0; i < node->nnames; i++) {
+            /* Evaluate value first, store in temp. */
+            if (i < nvals) {
+                compile_expr(f, node->children[i]);
+            } else {
+                emit_op(f, VT_OP_LOAD_NULL);
+                push1(f);
+            }
+            int tmp = scope_declare_local(f, "(local-tmp)");
+            emit_op(f, VT_OP_STORE_LOCAL);
+            emit_operand16(f, (uint16_t)tmp);
+            pop1(f);
+            /* Push scope, name, value. */
+            emit_op(f, VT_OP_LOAD_LOCAL);
+            emit_operand16(f, (uint16_t)f->env_slot);
+            push1(f);
+            uint16_t name_idx = const_add_string(f, node->names[i], strlen(node->names[i]));
+            emit_op(f, VT_OP_LOAD_CONST_STR);
+            emit_operand16(f, name_idx);
+            push1(f);
+            emit_op(f, VT_OP_LOAD_LOCAL);
+            emit_operand16(f, (uint16_t)tmp);
+            push1(f);
+            /* Stack: [scope][name][value] (value on top). */
+            emit_lua_call(f, LV_FN_SCOPE_DECLARE, 3);
+            emit_op(f, VT_OP_POP);
+            pop1(f);
+        }
+        return;
+    }
+    /* Main chunk: use VORTEX locals. */
     for (int i = 0; i < node->nnames; i++) {
         if (i < nvals) {
             compile_expr(f, node->children[i]);
@@ -874,13 +955,11 @@ static void compile_local(lv_func_cg_t *f, lv_node_t *node) {
         emit_op(f, VT_OP_STORE_LOCAL);
         emit_operand16(f, (uint16_t)slot);
         pop1(f);
-        /* Special case: if the value is a function literal, also store
-         * it in the global env under the same name. This allows the
-         * function to call itself recursively (the closure's body is
-         * evaluated by the tree-walker, which looks up names in the
-         * global env when not found in the local scope chain). */
-        if (i < nvals && node->children[i]->kind == LV_NODE_FUNCTION) {
-            /* env.name = value (already in local slot) */
+        /* Also store in the global env so nested closures can see it
+         * via the scope chain. This is necessary because closures
+         * capture the global env (local 0) — they can't see VORTEX
+         * locals from the enclosing chunk directly. */
+        {
             emit_op(f, VT_OP_LOAD_LOCAL);
             emit_operand16(f, (uint16_t)f->env_slot);
             push1(f);
@@ -1010,6 +1089,74 @@ static void compile_assign(lv_func_cg_t *f, lv_node_t *node) {
 static void compile_assign_v2(lv_func_cg_t *f, lv_node_t *node) {
     int ntargets = node->nchildren / 2;
     int nvals    = node->nchildren - ntargets;
+    if (f->use_scope_table) {
+        /* Function body: use SCOPE_SET for name assignments. */
+        for (int i = 0; i < ntargets; i++) {
+            lv_node_t *target = node->children[i];
+            lv_node_t *val    = (i < nvals) ? node->children[ntargets + i] : NULL;
+            if (target->kind == LV_NODE_NAME) {
+                /* Evaluate value to temp. */
+                if (val) compile_expr(f, val);
+                else { emit_op(f, VT_OP_LOAD_NULL); push1(f); }
+                int tmp = scope_declare_local(f, "(assign-tmp)");
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                pop1(f);
+                /* scope_set(local 0, name, value) */
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)f->env_slot);
+                push1(f);
+                uint16_t name_idx = const_add_string(f, target->str, strlen(target->str));
+                emit_op(f, VT_OP_LOAD_CONST_STR);
+                emit_operand16(f, name_idx);
+                push1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                push1(f);
+                emit_lua_call(f, LV_FN_SCOPE_SET, 3);
+                emit_op(f, VT_OP_POP);
+                pop1(f);
+            } else if (target->kind == LV_NODE_FIELD) {
+                if (val) compile_expr(f, val);
+                else { emit_op(f, VT_OP_LOAD_NULL); push1(f); }
+                int tmp = scope_declare_local(f, "(assign-tmp)");
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                pop1(f);
+                compile_expr(f, target->children[0]);
+                uint16_t name_idx = const_add_string(f, target->str, strlen(target->str));
+                emit_op(f, VT_OP_LOAD_CONST_STR);
+                emit_operand16(f, name_idx);
+                push1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                push1(f);
+                emit_lua_call(f, LV_FN_SET_FIELD, 3);
+                emit_op(f, VT_OP_POP);
+                pop1(f);
+            } else if (target->kind == LV_NODE_INDEX) {
+                if (val) compile_expr(f, val);
+                else { emit_op(f, VT_OP_LOAD_NULL); push1(f); }
+                int tmp = scope_declare_local(f, "(assign-tmp)");
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                pop1(f);
+                compile_expr(f, target->children[0]);
+                compile_expr(f, target->children[1]);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                push1(f);
+                emit_lua_call(f, LV_FN_SET_FIELD, 3);
+                emit_op(f, VT_OP_POP);
+                pop1(f);
+            } else {
+                cg_set_error(f->cg, "cannot assign to this expression");
+                return;
+            }
+        }
+        return;
+    }
+    /* Main chunk: use VORTEX locals. */
     for (int i = 0; i < ntargets; i++) {
         lv_node_t *target = node->children[i];
         lv_node_t *val    = (i < nvals) ? node->children[ntargets + i] : NULL;
@@ -1023,9 +1170,9 @@ static void compile_assign_v2(lv_func_cg_t *f, lv_node_t *node) {
                 emit_op(f, VT_OP_STORE_LOCAL);
                 emit_operand16(f, (uint16_t)slot);
                 pop1(f);
-                /* If the value is a function literal, also store in env
-                 * for recursive access. */
-                if (val && val->kind == LV_NODE_FUNCTION) {
+                /* Also update the global env so nested closures see
+                 * the new value via the scope chain. */
+                {
                     emit_op(f, VT_OP_LOAD_LOCAL);
                     emit_operand16(f, (uint16_t)f->env_slot);
                     push1(f);
@@ -1214,22 +1361,15 @@ static void compile_if(lv_func_cg_t *f, lv_node_t *node) {
 }
 
 static void compile_for_num(lv_func_cg_t *f, lv_node_t *node) {
-    /* numeric for: for v = init, limit, step do body end
-     * exprs[0]=init, exprs[1]=limit, exprs[2]=step (or NULL).
-     * Lowering:
-     *   local v = init
-     *   local limit = limit
-     *   local step = step or 1
-     *   loop_start:
-     *     if (step > 0 and v > limit) or (step < 0 and v < limit): goto loop_end
-     *     body
-     *     v = v + step
-     *     goto loop_start
-     *   loop_end:
-     */
-    /* Evaluate init, limit, step into locals. */
+    /* numeric for: for v = init, limit, step do body end */
+    /* In scope-table mode, the loop variable v is stored in the scope
+     * table (so the body can access it via SCOPE_GET). The internal
+     * state (limit, step, v_internal) uses VORTEX locals. */
+    bool use_scope = f->use_scope_table;
+
+    /* Evaluate init into v_slot (VORTEX local, used as internal state). */
     compile_expr(f, node->exprs[0]);
-    int v_slot = scope_declare_local(f, node->names[0]);
+    int v_slot = scope_declare_local(f, "(for-v)");
     emit_op(f, VT_OP_STORE_LOCAL);
     emit_operand16(f, (uint16_t)v_slot);
     pop1(f);
@@ -1256,9 +1396,7 @@ static void compile_for_num(lv_func_cg_t *f, lv_node_t *node) {
     int loop_end   = label_alloc(f);
     label_place(f, loop_start);
 
-    /* Condition: (step > 0 and v > limit) or (step < 0 and v < limit)
-     * For MVP, we just check v > limit (assuming positive step).
-     * We emit limit < v (swapped operands of LT) to get v > limit. */
+    /* Condition: v > limit (emitted as limit < v). */
     emit_op(f, VT_OP_LOAD_LOCAL);
     emit_operand16(f, (uint16_t)limit_slot);
     push1(f);
@@ -1266,13 +1404,36 @@ static void compile_for_num(lv_func_cg_t *f, lv_node_t *node) {
     emit_operand16(f, (uint16_t)v_slot);
     push1(f);
     emit_lua_call(f, LV_FN_CMP_LT, 2);
-    /* If true (limit < v, i.e. v > limit), exit loop. */
     emit_if_true(f, loop_end);
 
     /* Body. */
     scope_enter(f);
     f->loop_depth++;
     break_push(f, loop_end);
+    /* Store v into the scope table so the body can read it. */
+    if (use_scope) {
+        emit_op(f, VT_OP_LOAD_LOCAL);
+        emit_operand16(f, (uint16_t)f->env_slot);
+        push1(f);
+        uint16_t ni = const_add_string(f, node->names[0], strlen(node->names[0]));
+        emit_op(f, VT_OP_LOAD_CONST_STR);
+        emit_operand16(f, ni);
+        push1(f);
+        emit_op(f, VT_OP_LOAD_LOCAL);
+        emit_operand16(f, (uint16_t)v_slot);
+        push1(f);
+        emit_lua_call(f, LV_FN_SCOPE_DECLARE, 3);
+        emit_op(f, VT_OP_POP);
+        pop1(f);
+    } else {
+        int user_slot = scope_declare_local(f, node->names[0]);
+        emit_op(f, VT_OP_LOAD_LOCAL);
+        emit_operand16(f, (uint16_t)v_slot);
+        push1(f);
+        emit_op(f, VT_OP_STORE_LOCAL);
+        emit_operand16(f, (uint16_t)user_slot);
+        pop1(f);
+    }
     for (int i = 0; i < node->nchildren; i++) {
         compile_stmt(f, node->children[i]);
     }
@@ -1442,38 +1603,94 @@ loop_body:
         scope_enter(f);
         f->loop_depth++;
         break_push(f, loop_end);
-        /* First loop variable gets the key (var_slot). */
-        if (node->nnames >= 1) {
-            int slot = scope_declare_local(f, node->names[0]);
-            emit_op(f, VT_OP_LOAD_LOCAL);
-            emit_operand16(f, (uint16_t)var_slot);
-            push1(f);
-            emit_op(f, VT_OP_STORE_LOCAL);
-            emit_operand16(f, (uint16_t)slot);
-            pop1(f);
-        }
-        /* Second loop variable gets t[var_slot] (the value). */
-        if (node->nnames >= 2) {
-            int slot = scope_declare_local(f, node->names[1]);
-            emit_op(f, VT_OP_LOAD_LOCAL);
-            emit_operand16(f, (uint16_t)s_slot);
-            push1(f);
-            emit_op(f, VT_OP_LOAD_LOCAL);
-            emit_operand16(f, (uint16_t)var_slot);
-            push1(f);
-            emit_lua_call(f, LV_FN_GET_FIELD, 2);
-            emit_op(f, VT_OP_STORE_LOCAL);
-            emit_operand16(f, (uint16_t)slot);
-            pop1(f);
-        }
-        /* Additional loop variables get nil. */
-        for (int i = 2; i < node->nnames; i++) {
-            int slot = scope_declare_local(f, node->names[i]);
-            emit_op(f, VT_OP_LOAD_NULL);
-            push1(f);
-            emit_op(f, VT_OP_STORE_LOCAL);
-            emit_operand16(f, (uint16_t)slot);
-            pop1(f);
+        if (f->use_scope_table) {
+            /* In scope-table mode, store loop vars in the scope table. */
+            /* First var: the key (var_slot). */
+            if (node->nnames >= 1) {
+                /* Evaluate var_slot, store to temp, then scope_declare. */
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)var_slot);
+                push1(f);
+                int tmp = scope_declare_local(f, "(loop-tmp)");
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                pop1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)f->env_slot);
+                push1(f);
+                uint16_t ni = const_add_string(f, node->names[0], strlen(node->names[0]));
+                emit_op(f, VT_OP_LOAD_CONST_STR);
+                emit_operand16(f, ni);
+                push1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                push1(f);
+                emit_lua_call(f, LV_FN_SCOPE_DECLARE, 3);
+                emit_op(f, VT_OP_POP);
+                pop1(f);
+            }
+            /* Second var: t[var_slot] (the value). */
+            if (node->nnames >= 2) {
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)s_slot);
+                push1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)var_slot);
+                push1(f);
+                emit_lua_call(f, LV_FN_GET_FIELD, 2);
+                int tmp = scope_declare_local(f, "(loop-tmp)");
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                pop1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)f->env_slot);
+                push1(f);
+                uint16_t ni = const_add_string(f, node->names[1], strlen(node->names[1]));
+                emit_op(f, VT_OP_LOAD_CONST_STR);
+                emit_operand16(f, ni);
+                push1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)tmp);
+                push1(f);
+                emit_lua_call(f, LV_FN_SCOPE_DECLARE, 3);
+                emit_op(f, VT_OP_POP);
+                pop1(f);
+            }
+        } else {
+            /* Main chunk: use VORTEX locals. */
+            /* First loop variable gets the key (var_slot). */
+            if (node->nnames >= 1) {
+                int slot = scope_declare_local(f, node->names[0]);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)var_slot);
+                push1(f);
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)slot);
+                pop1(f);
+            }
+            /* Second loop variable gets t[var_slot] (the value). */
+            if (node->nnames >= 2) {
+                int slot = scope_declare_local(f, node->names[1]);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)s_slot);
+                push1(f);
+                emit_op(f, VT_OP_LOAD_LOCAL);
+                emit_operand16(f, (uint16_t)var_slot);
+                push1(f);
+                emit_lua_call(f, LV_FN_GET_FIELD, 2);
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)slot);
+                pop1(f);
+            }
+            /* Additional loop variables get nil. */
+            for (int i = 2; i < node->nnames; i++) {
+                int slot = scope_declare_local(f, node->names[i]);
+                emit_op(f, VT_OP_LOAD_NULL);
+                push1(f);
+                emit_op(f, VT_OP_STORE_LOCAL);
+                emit_operand16(f, (uint16_t)slot);
+                pop1(f);
+            }
         }
 
         /* Body. */
@@ -1524,28 +1741,72 @@ static void compile_label(lv_func_cg_t *f, lv_node_t *node) {
     (void)node;
 }
 
+/* Compile a function body to a separate VORTEX bytecode module.
+ * Uses the scope-table model: local 0 = scope table, all variable
+ * accesses go through SCOPE_GET/SCOPE_SET.
+ * Returns the bytecode module (caller owns it) and registers it with
+ * the runtime under the proto_id. */
+static vtx_bytecode_t *compile_function_body(lv_codegen_t *cg, lv_func_proto_t *proto) {
+    lv_func_cg_t f;
+    func_cg_init(&f, cg, /*is_function=*/true, proto->is_vararg);
+    f.use_scope_table = true;
+
+    /* Compile the body statements. */
+    for (int i = 0; i < proto->nbody; i++) {
+        compile_stmt(&f, proto->body[i]);
+        if (cg->last_error) {
+            func_cg_fini(&f);
+            return NULL;
+        }
+    }
+
+    /* Emit a final RETURN to ensure clean exit. */
+    emit_op(&f, VT_OP_RETURN);
+
+    /* Resolve forward jumps. */
+    resolve_jumps(&f);
+
+    /* Build the vtx_bytecode_t. */
+    vtx_bytecode_t *bc = lv_alloc(sizeof(*bc));
+    memset(bc, 0, sizeof(*bc));
+    bc->code = f.code.code;
+    bc->length = f.code.len;
+    bc->constant_pool = f.pool.consts;
+    bc->constant_count = f.pool.count;
+    bc->max_locals = (uint16_t)f.scope.max_slots;
+    bc->max_stack = (uint16_t)f.max_stack;
+
+    /* Detach buffers from f. */
+    f.code.code = NULL;
+    f.pool.consts = NULL;
+    func_cg_fini(&f);
+    return bc;
+}
+
 static void compile_function(lv_func_cg_t *f, lv_node_t *node) {
-    /* For MVP, function literals are compiled to a runtime closure via
-     * LV_FN_NEW_CLOSURE. The function body is compiled to a separate
-     * bytecode buffer and registered with the runtime under a unique
-     * function ID. The closure carries this ID.
-     *
-     * However, this requires nested function compilation support, which
-     * is non-trivial. For the MVP, we emit a stub closure that calls
-     * into the runtime, which uses the AST to evaluate the body via a
-     * tree-walking interpreter as a fallback.
-     *
-     * This is a significant limitation — closures defined in Lua source
-     * are not JIT-compiled. A future version will compile nested
-     * function bodies to VORTEX methods. */
     lv_func_proto_t *proto = node->proto;
+    /* Register the proto with the runtime. */
     int proto_id = lv_runtime_register_proto(f->cg->rt, proto);
-    /* Emit: NEW_CLOSURE(proto_id) → closure */
+    /* Compile the function body to VORTEX bytecode. */
+    vtx_bytecode_t *bc = compile_function_body(f->cg, proto);
+    if (!bc) {
+        cg_set_error(f->cg, "failed to compile function body");
+        return;
+    }
+    lv_runtime_set_proto_bytecode(f->cg->rt, proto_id, bc);
+
+    /* Emit: NEW_CLOSURE_WITH_ENV(proto_id, captured_env)
+     * The captured env is the current scope: in the main chunk, it's
+     * local 0 (the global env); in a function body, it's local 0 (the
+     * scope table). Either way, we pass local 0 as the captured env. */
     uint16_t id_idx = const_add_int(f, proto_id);
     emit_op(f, VT_OP_LOAD_CONST_INT);
     emit_operand16(f, id_idx);
     push1(f);
-    emit_lua_call(f, LV_FN_NEW_CLOSURE, 1);
+    emit_op(f, VT_OP_LOAD_LOCAL);
+    emit_operand16(f, (uint16_t)f->env_slot);
+    push1(f);
+    emit_lua_call(f, LV_FN_NEW_CLOSURE_WITH_ENV, 2);
 }
 
 static void compile_stmt(lv_func_cg_t *f, lv_node_t *node) {
