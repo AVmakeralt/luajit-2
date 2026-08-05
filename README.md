@@ -19,14 +19,6 @@ Lua source → Lexer → Parser → AST → Codegen → VORTEX bytecode → Runt
 - **Stdlib** (`stdlib.rs`): full Lua stdlib in Rust (print, type, string.*, math.*, table.*, io.*, os.*)
 - **Multi-file**: `require()` and `dofile()` support with module caching
 
-## The VORTEX patch problem
-
-The published `vortex-jit` crate doesn't expose an extension point for `CALL_RUNTIME` opcodes with `func_id >= 100`. LuaVortex needs this to implement dynamic dispatch (string ops, table ops, function calls) from bytecode.
-
-The `build.rs` attempts to work around this by compiling a patched copy of `dispatch.c` and linking it via `--allow-multiple-definition`. However, **the linker uses the unpatched version from `libvortex.a` first**, so the callback is never invoked.
-
-**To fix this**, the VORTEX repo needs the extended CALL_RUNTIME hook pushed to its `rust-bindings/` directory. The patch is ready in this repo's `build.rs` — it just needs to be applied upstream.
-
 ## Building
 
 ```bash
