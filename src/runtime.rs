@@ -12,7 +12,6 @@ use std::rc::Rc;
 use vortex::Runtime as VortexRT;
 
 // The VORTEX bytecode struct layout (must match runtime/bytecode.h).
-// We define this ourselves to avoid depending on the private ffi module.
 #[repr(C)]
 pub struct VtxBytecode {
     code: *const u8,
@@ -23,8 +22,7 @@ pub struct VtxBytecode {
     max_stack: u16,
 }
 
-/// A wrapper around a VORTEX bytecode module that we constructed in memory.
-/// We keep the code/constant buffers alive in the BytecodeBuf.
+/// A wrapper around a VORTEX bytecode module constructed in memory.
 struct BytecodeBuf {
     ptr: *mut VtxBytecode,
     _code: Vec<u8>,
@@ -41,22 +39,14 @@ impl Drop for BytecodeBuf {
     }
 }
 
-// FFI declarations for the extended CALL_RUNTIME callback (patched by build.rs)
-type RuntimeCallback = unsafe extern "C" fn(
-    func_id: u16, arg_count: u16, argv: *const Value, user_data: *mut c_void,
-) -> Value;
-
+// FFI for the VORTEX runtime's run_with_args.
 extern "C" {
-    fn vtx_set_runtime_callback(cb: Option<RuntimeCallback>, user_data: *mut c_void);
-    fn vtx_clear_runtime_callback();
-}
-
-unsafe fn set_runtime_callback(cb: RuntimeCallback, user_data: *mut c_void) {
-    vtx_set_runtime_callback(Some(cb), user_data);
-}
-
-fn clear_runtime_callback() {
-    unsafe { vtx_clear_runtime_callback(); }
+    fn vtx_runtime_run_with_args(
+        rt: *mut c_void,
+        bc: *const VtxBytecode,
+        args: *const Value,
+        arg_count: u32,
+    ) -> Value;
 }
 
 /// Lua stdlib function IDs (packed into CALL_RUNTIME operands as
@@ -116,18 +106,6 @@ pub enum FnId {
     NewScope = 243, NewClosureWithEnv = 244,
     // Multi-file
     Require = 300, Dofile = 301,
-}
-
-// FFI for the VORTEX runtime functions we need (since the published
-// Rust crate doesn't expose all of them with the right signatures for
-// our use case).
-extern "C" {
-    fn vtx_runtime_run_with_args(
-        rt: *mut c_void,
-        bc: *const VtxBytecode,
-        args: *const Value,
-        arg_count: u32,
-    ) -> Value;
 }
 
 /// The LuaVortex runtime. Wraps a VORTEX runtime and provides the
@@ -201,9 +179,7 @@ impl Runtime {
 
         // Register the runtime callback
         let rt_ptr = self as *mut Runtime as *mut c_void;
-        unsafe {
-            set_runtime_callback(dispatch_callback, rt_ptr);
-        }
+        vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
 
         let env_val = make_table(self.globals.clone());
         let vrt_ptr = self.vrt.as_ptr() as *mut c_void;
@@ -216,7 +192,7 @@ impl Runtime {
             )
         };
 
-        clear_runtime_callback();
+        vortex::set_runtime_callback(None, std::ptr::null_mut());
 
         // Clean up the main chunk bytecode
         self.proto_bytecode.borrow_mut().remove(&-1);
@@ -354,15 +330,15 @@ impl Runtime {
         // to the vortex::Runtime IS a pointer to the inner runtime
         // (same address, since it's the first and only field).
         let vrt_ptr = &self.vrt as *const VortexRT as *mut c_void;
+        vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
         unsafe {
-            set_runtime_callback(dispatch_callback, rt_ptr);
             let result = vtx_runtime_run_with_args(
                 vrt_ptr,
                 bc_ptr,
                 &[scope_val] as *const Value,
                 1,
             );
-            clear_runtime_callback();
+            vortex::set_runtime_callback(None, std::ptr::null_mut());
             result
         }
     }
@@ -374,18 +350,41 @@ impl Runtime {
 }
 
 /// The C-callable callback that dispatches extended CALL_RUNTIME opcodes.
-unsafe extern "C" fn dispatch_callback(
-    func_id: u16,
-    _arg_count: u16,
-    argv: *const Value,
+///
+/// VORTEX 0.7.1+ callback signature: `(operand, sp, user_data) -> i32`
+///   - operand: the CALL_RUNTIME operand = (fn_id << 6) | argc
+///   - sp: pointer to the stack pointer; the callback pops args and pushes results
+///   - returns: number of values pushed (0 = void, 1 = single)
+extern "C" fn dispatch_callback(
+    operand: u32,
+    sp: *mut *mut u64,
     user_data: *mut c_void,
-) -> Value {
-    let rt = &*(user_data as *const Runtime);
-    let argc = _arg_count as usize;
-    let args = if argc > 0 {
-        std::slice::from_raw_parts(argv, argc)
-    } else {
-        &[]
-    };
-    stdlib::dispatch(rt, func_id, args)
+) -> i32 {
+    let rt: &Runtime = unsafe { &*(user_data as *const Runtime) };
+    let fn_id = (operand >> 6) as u16;
+    let argc = (operand & 0x3F) as usize;
+
+    // Pop `argc` values from the stack into an argv buffer.
+    let mut argv_buf = [0u64; 64];
+    if argc > 0 && argc <= 64 {
+        unsafe {
+            let stack_ptr = *sp;
+            for i in 0..argc {
+                argv_buf[i] = *stack_ptr.sub(argc - i);
+            }
+            *sp = stack_ptr.sub(argc);
+        }
+    }
+
+    let args = &argv_buf[..argc.min(64)];
+    let result = stdlib::dispatch(rt, fn_id, args);
+
+    // Push the result onto the stack
+    unsafe {
+        let stack_ptr = *sp;
+        *stack_ptr = result;
+        *sp = stack_ptr.add(1);
+    }
+
+    1 // pushed 1 value
 }

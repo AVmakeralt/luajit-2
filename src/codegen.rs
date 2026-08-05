@@ -59,24 +59,25 @@ mod op {
     pub const CALL_INTERFACE: u8 = 46;
     pub const RETURN: u8 = 47;
     pub const RETURN_VALUE: u8 = 48;
-    pub const NEW: u8 = 49;
-    pub const NEWARRAY: u8 = 50;
-    pub const CHECKCAST: u8 = 51;
-    pub const INSTANCEOF: u8 = 52;
-    pub const ARRAY_LOAD: u8 = 53;
-    pub const ARRAY_STORE: u8 = 54;
-    pub const ARRAY_LENGTH: u8 = 55;
-    pub const THROW: u8 = 56;
-    pub const CATCH: u8 = 57;
-    pub const CATCH_TYPED: u8 = 58;
-    pub const MONITOR_ENTER: u8 = 59;
-    pub const MONITOR_EXIT: u8 = 60;
-    pub const DUP: u8 = 61;
-    pub const POP: u8 = 62;
-    pub const SWAP: u8 = 63;
-    pub const ISNULL: u8 = 64;
-    pub const TYPEOF: u8 = 65;
-    pub const CALL_RUNTIME: u8 = 66;
+    // 49: RETURN_MULTI, 50-52: VARARG opcodes (not used)
+    pub const NEW: u8 = 53;
+    pub const NEWARRAY: u8 = 54;
+    pub const CHECKCAST: u8 = 55;
+    pub const INSTANCEOF: u8 = 56;
+    pub const ARRAY_LOAD: u8 = 57;
+    pub const ARRAY_STORE: u8 = 58;
+    pub const ARRAY_LENGTH: u8 = 59;
+    pub const THROW: u8 = 60;
+    pub const CATCH: u8 = 61;
+    pub const CATCH_TYPED: u8 = 62;
+    pub const MONITOR_ENTER: u8 = 63;
+    pub const MONITOR_EXIT: u8 = 64;
+    pub const DUP: u8 = 65;
+    pub const POP: u8 = 66;
+    pub const SWAP: u8 = 67;
+    pub const ISNULL: u8 = 68;
+    pub const TYPEOF: u8 = 69;
+    pub const CALL_RUNTIME: u8 = 70;
 }
 
 /// A compiled bytecode module.
@@ -103,6 +104,8 @@ struct FuncCg {
     break_labels: Vec<u32>,
     loop_depth: u32,
     error: Option<String>,
+    /// Local variable name→slot mappings (for the main chunk's VORTEX locals).
+    locals: Vec<(String, u16)>,
 }
 
 impl FuncCg {
@@ -122,8 +125,24 @@ impl FuncCg {
             break_labels: Vec::new(),
             loop_depth: 0,
             error: None,
+            locals: Vec::new(),
         };
         f
+    }
+
+    fn declare_local(&mut self, name: &str) -> u16 {
+        let slot = self.next_local;
+        self.next_local += 1;
+        if self.next_local > self.max_locals { self.max_locals = self.next_local; }
+        self.locals.push((name.to_string(), slot));
+        slot
+    }
+
+    fn lookup_local(&self, name: &str) -> Option<u16> {
+        for (n, slot) in self.locals.iter().rev() {
+            if n == name { return Some(*slot); }
+        }
+        None
     }
 
     fn emit_byte(&mut self, b: u8) {
@@ -233,6 +252,9 @@ impl FuncCg {
     fn emit_lua_call(&mut self, fn_id: FnId, argc: u16) {
         let id = fn_id as u16;
         self.emit_op(op::CALL_RUNTIME);
+        // Pack fn_id and argc into the 16-bit operand:
+        //   operand = (fn_id << 6) | (argc & 0x3F)
+        // The callback unpacks them: fn_id = operand >> 6, argc = operand & 0x3F
         let operand = (id << 6) | (argc & 0x3F);
         self.emit_u16(operand);
         // stack: pop argc, push 1
@@ -338,8 +360,7 @@ fn compile_local(rt: &Runtime, f: &mut FuncCg, names: &[String], vals: &[Node]) 
             f.emit_lua_call(FnId::ScopeDeclare, 3);
             f.emit_op(op::POP); f.pop1();
         } else {
-            let slot = f.next_local; f.next_local += 1;
-            if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+            let slot = f.declare_local(name);
             f.emit_op(op::STORE_LOCAL);
             f.emit_u16(slot);
             f.pop1();
@@ -505,8 +526,7 @@ fn compile_for_num(rt: &Runtime, f: &mut FuncCg, name: &str, init: &Node, limit:
         f.emit_lua_call(FnId::ScopeDeclare, 3);
         f.emit_op(op::POP); f.pop1();
     } else {
-        let user_slot = f.next_local; f.next_local += 1;
-        if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+        let user_slot = f.declare_local(name);
         f.emit_op(op::LOAD_LOCAL); f.emit_u16(v_slot); f.push1();
         f.emit_op(op::STORE_LOCAL); f.emit_u16(user_slot); f.pop1();
     }
@@ -571,8 +591,7 @@ fn compile_for_in(rt: &Runtime, f: &mut FuncCg, names: &[String], exprs: &[Node]
                             f.emit_lua_call(FnId::ScopeDeclare, 3);
                             f.emit_op(op::POP); f.pop1();
                         } else {
-                            let user_slot = f.next_local; f.next_local += 1;
-                            if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+                            let user_slot = f.declare_local(&names[0]);
                             f.emit_op(op::LOAD_LOCAL); f.emit_u16(var_slot); f.push1();
                             f.emit_op(op::STORE_LOCAL); f.emit_u16(user_slot); f.pop1();
                         };
@@ -683,15 +702,23 @@ fn compile_expr(rt: &Runtime, f: &mut FuncCg, node: &Node) {
 
 fn compile_name(rt: &Runtime, f: &mut FuncCg, name: &str) {
     if f.use_scope_table {
+        // Function body: ScopeGet
         f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
         let ni = f.const_add_str(rt, name.as_bytes());
         f.emit_op(op::LOAD_CONST_STR); f.emit_u16(ni); f.push1();
         f.emit_lua_call(FnId::ScopeGet, 2);
     } else {
-        f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
-        let ni = f.const_add_str(rt, name.as_bytes());
-        f.emit_op(op::LOAD_CONST_STR); f.emit_u16(ni); f.push1();
-        f.emit_lua_call(FnId::GlobalGet, 2);
+        // Main chunk: check VORTEX locals first, then global env
+        if let Some(slot) = f.lookup_local(name) {
+            f.emit_op(op::LOAD_LOCAL);
+            f.emit_u16(slot);
+            f.push1();
+        } else {
+            f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
+            let ni = f.const_add_str(rt, name.as_bytes());
+            f.emit_op(op::LOAD_CONST_STR); f.emit_u16(ni); f.push1();
+            f.emit_lua_call(FnId::GlobalGet, 2);
+        }
     }
 }
 
