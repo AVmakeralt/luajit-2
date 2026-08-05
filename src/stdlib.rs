@@ -5,6 +5,8 @@ use crate::value::*;
 use std::os::raw::c_void;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::sync::OnceLock;
+static OS_START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
 
 type Args<'a> = &'a [Value];
 
@@ -99,7 +101,7 @@ pub fn dispatch(rt: &Runtime, fn_id: u16, args: Args) -> Value {
         }
         // OS
         Some(FnId::OsTime) => make_smi(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64),
-        Some(FnId::OsClock) => make_double(std::time::Instant::now().elapsed().as_secs_f64()),
+        Some(FnId::OsClock) => make_double(OS_START.elapsed().as_secs_f64()),
         Some(FnId::OsDate) => {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
             rt.intern_string(format!("epoch: {}", now).as_bytes())
@@ -499,28 +501,197 @@ fn do_str_format(rt: &Runtime, args: Args) -> Value {
         if chars[i] != '%' { result.push(chars[i]); i += 1; continue; }
         i += 1;
         if i >= chars.len() { break; }
-        match chars[i] {
+
+        // Parse format specifier: %[flags][width][.precision]conversion
+        let spec_start = i;
+        // flags
+        while i < chars.len() && "-+ #0".contains(chars[i]) { i += 1; }
+        // width
+        while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+        // precision
+        if i < chars.len() && chars[i] == '.' {
+            i += 1;
+            while i < chars.len() && chars[i].is_ascii_digit() { i += 1; }
+        }
+        if i >= chars.len() { break; }
+
+        let spec: String = chars[spec_start..i].iter().collect();
+        let conv = chars[i];
+
+        match conv {
             '%' => result.push('%'),
-            'd'|'i' => { result.push_str(&format!("{}", to_int(args.get(arg_i).copied().unwrap_or(NULL)).unwrap_or(0))); arg_i += 1; }
-            'u'|'x'|'X'|'o' => {
-                let v = to_int(args.get(arg_i).copied().unwrap_or(NULL)).unwrap_or(0) as u64;
-                result.push_str(&match chars[i] { 'u'=>format!("{}",v), 'x'=>format!("{:x}",v), 'X'=>format!("{:X}",v), 'o'=>format!("{:o}",v), _=>unreachable!() });
+            'd'|'i' => {
+                let v = to_int(args.get(arg_i).copied().unwrap_or(NULL)).unwrap_or(0);
+                result.push_str(&c_format(&spec, 'd', v as i64));
                 arg_i += 1;
             }
-            'f'|'g'|'e'|'F'|'G'|'E' => {
-                result.push_str(&format!("{}", to_double(args.get(arg_i).copied().unwrap_or(NULL))));
+            'u' => {
+                let v = to_int(args.get(arg_i).copied().unwrap_or(NULL)).unwrap_or(0) as u64;
+                result.push_str(&c_format_u(&spec, 'u', v));
+                arg_i += 1;
+            }
+            'x'|'X' => {
+                let v = to_int(args.get(arg_i).copied().unwrap_or(NULL)).unwrap_or(0) as u64;
+                result.push_str(&c_format_u(&spec, conv, v));
+                arg_i += 1;
+            }
+            'o' => {
+                let v = to_int(args.get(arg_i).copied().unwrap_or(NULL)).unwrap_or(0) as u64;
+                result.push_str(&c_format_u(&spec, 'o', v));
+                arg_i += 1;
+            }
+            'f'|'F' => {
+                let d = to_double(args.get(arg_i).copied().unwrap_or(NULL));
+                result.push_str(&c_format_f(&spec, conv, d));
+                arg_i += 1;
+            }
+            'e'|'E' => {
+                let d = to_double(args.get(arg_i).copied().unwrap_or(NULL));
+                result.push_str(&c_format_e(&spec, conv, d));
+                arg_i += 1;
+            }
+            'g'|'G' => {
+                let d = to_double(args.get(arg_i).copied().unwrap_or(NULL));
+                result.push_str(&c_format_g(&spec, conv, d));
                 arg_i += 1;
             }
             's' => {
-                result.push_str(&String::from_utf8_lossy(&to_lua_string(args.get(arg_i).copied().unwrap_or(NULL))));
+                let s_val = to_lua_string(args.get(arg_i).copied().unwrap_or(NULL)); let s = String::from_utf8_lossy(&s_val);
+                // Handle width/precision for strings
+                if spec.is_empty() {
+                    result.push_str(&s);
+                } else {
+                    let (width, _precision) = parse_width_prec(&spec);
+                    let s = if let Some(dot) = spec.find('.') {
+                        let prec: usize = spec[dot+1..].parse().unwrap_or(usize::MAX);
+                        if s.len() > prec { s[..prec].to_string() } else { s.to_string() }
+                    } else { s.to_string() };
+                    if width > s.len() {
+                        let pad = " ".repeat(width - s.len());
+                        if spec.contains('-') { result.push_str(&s); result.push_str(&pad); }
+                        else { result.push_str(&pad); result.push_str(&s); }
+                    } else {
+                        result.push_str(&s);
+                    }
+                }
                 arg_i += 1;
             }
-            'c' => { if let Some(c) = to_int(args.get(arg_i).copied().unwrap_or(NULL)) { result.push(c as u8 as char); } arg_i += 1; }
-            _ => { result.push('%'); result.push(chars[i]); }
+            'c' => {
+                if let Some(c) = to_int(args.get(arg_i).copied().unwrap_or(NULL)) { result.push(c as u8 as char); }
+                arg_i += 1;
+            }
+            'q' => {
+                let s_val = to_lua_string(args.get(arg_i).copied().unwrap_or(NULL)); let s = String::from_utf8_lossy(&s_val);
+                result.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => { result.push_str("\\\""); }
+                        '\\' => { result.push_str("\\\\"); }
+                        '\n' => { result.push_str("\\n"); }
+                        '\r' => { result.push_str("\\r"); }
+                        '\t' => { result.push_str("\\t"); }
+                        _ => result.push(ch),
+                    }
+                }
+                result.push('"');
+                arg_i += 1;
+            }
+            _ => { result.push('%'); result.push_str(&spec); result.push(conv); }
         }
         i += 1;
     }
     rt.intern_string(result.as_bytes())
+}
+
+fn parse_width_prec(spec: &str) -> (usize, Option<usize>) {
+    let mut s = spec;
+    // skip flags
+    while !s.is_empty() && "-+ #0".contains(s.chars().next().unwrap()) { s = &s[1..]; }
+    let mut width = 0usize;
+    while !s.is_empty() && s.chars().next().unwrap().is_ascii_digit() {
+        width = width * 10 + (s.chars().next().unwrap() as usize - '0' as usize);
+        s = &s[1..];
+    }
+    let precision = if !s.is_empty() && s.starts_with('.') {
+        let rest = &s[1..];
+        let p: usize = rest.parse().unwrap_or(0);
+        Some(p)
+    } else { None };
+    (width, precision)
+}
+
+fn c_format(spec: &str, conv: char, v: i64) -> String {
+    let (width, _prec) = parse_width_prec(spec);
+    let s = format!("{}", v);
+    if width > s.len() && !spec.contains('-') {
+        let pad = if spec.contains('0') { "0" } else { " " };
+        let pad_str = pad.repeat(width - s.len());
+        if v < 0 && pad == "0" {
+            format!("-{}{}", pad_str, &s[1..])
+        } else {
+            format!("{}{}", pad_str, s)
+        }
+    } else if width > s.len() && spec.contains('-') {
+        format!("{}{}", s, " ".repeat(width - s.len()))
+    } else {
+        s
+    }
+}
+
+fn c_format_u(spec: &str, conv: char, v: u64) -> String {
+    let s = match conv {
+        'u' => format!("{}", v),
+        'x' => format!("{:x}", v),
+        'X' => format!("{:X}", v),
+        'o' => format!("{:o}", v),
+        _ => format!("{}", v),
+    };
+    let (width, _) = parse_width_prec(spec);
+    if width > s.len() {
+        let pad = if spec.contains('0') { "0" } else { " " };
+        format!("{}{}", pad.repeat(width - s.len()), s)
+    } else { s }
+}
+
+fn c_format_f(spec: &str, conv: char, d: f64) -> String {
+    let (width, prec) = parse_width_prec(spec);
+    let p = prec.unwrap_or(6);
+    let s = format!("{:.*}", p, d);
+    if width > s.len() {
+        let pad = if spec.contains('0') { "0" } else { " " };
+        if spec.contains('-') {
+            format!("{}{}", s, " ".repeat(width - s.len()))
+        } else if spec.contains('0') && !d.is_sign_negative() {
+            format!("{}{}", pad.repeat(width - s.len()), s)
+        } else if spec.contains('0') && d.is_sign_negative() {
+            format!("-{}{}", pad.repeat(width - s.len() - 1), &s[1..])
+        } else {
+            format!("{}{}", " ".repeat(width - s.len()), s)
+        }
+    } else { s }
+}
+
+fn c_format_e(spec: &str, conv: char, d: f64) -> String {
+    let (width, prec) = parse_width_prec(spec);
+    let p = prec.unwrap_or(6);
+    let s = if conv == 'E' { format!("{:.*E}", p, d) } else { format!("{:.*e}", p, d) };
+    if width > s.len() {
+        format!("{}{}", " ".repeat(width - s.len()), s)
+    } else { s }
+}
+
+fn c_format_g(spec: &str, conv: char, d: f64) -> String {
+    let (width, prec) = parse_width_prec(spec);
+    let p = prec.unwrap_or(6);
+    // Simplified %g: use %e or %f depending on magnitude
+    let s = if d.abs() < 1e-4 || d.abs() >= 1e21 {
+        if conv == 'G' { format!("{:.*E}", p, d) } else { format!("{:.*e}", p, d) }
+    } else {
+        format!("{}", d)
+    };
+    if width > s.len() {
+        format!("{}{}", " ".repeat(width - s.len()), s)
+    } else { s }
 }
 
 fn do_str_find(args: Args) -> Value {
@@ -971,7 +1142,7 @@ pub extern "C" fn native_os_time(_args: Args, _ud: *mut c_void) -> Value {
     make_smi(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
 }
 pub extern "C" fn native_os_clock(_args: Args, _ud: *mut c_void) -> Value {
-    make_double(std::time::Instant::now().elapsed().as_secs_f64())
+    make_double(OS_START.elapsed().as_secs_f64())
 }
 pub extern "C" fn native_os_date(_args: Args, ud: *mut c_void) -> Value {
     with_rt(ud, |rt| {

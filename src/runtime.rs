@@ -373,31 +373,24 @@ impl Runtime {
             }
         };
 
-        let scope = LuaTable::new();
-        let parent_val = f.captured_env.unwrap_or_else(|| make_table(self.globals.clone()));
-        let parent_key = self.intern_string(b"__parent");
-        scope.set(parent_key, parent_val);
-
-        for (i, param) in proto.params.iter().enumerate() {
-            let pname = self.intern_string(param.as_bytes());
-            let val = args.get(i).copied().unwrap_or(NULL);
-            scope.set(pname, val);
+        // Build the args array: [env_table, param1, param2, ...]
+        // local 0 = env (globals table), local 1..n = parameters
+        let env_val = make_table(self.globals.clone());
+        let mut run_args = Vec::with_capacity(1 + proto.params.len());
+        run_args.push(env_val);
+        for i in 0..proto.params.len() {
+            run_args.push(args.get(i).copied().unwrap_or(NULL));
         }
 
-        let scope_val = make_table(scope);
         let rt_ptr = self as *const Runtime as *mut c_void;
-        // Get the VORTEX runtime pointer. The vortex::Runtime struct
-        // has `inner: ffi::vtx_runtime_t` as its only field. A pointer
-        // to the vortex::Runtime IS a pointer to the inner runtime
-        // (same address, since it's the first and only field).
         let vrt_ptr = self.vrt_ptr;
         vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
         let result = unsafe {
             let r = vtx_runtime_run_with_args(
                 vrt_ptr,
                 bc_ptr,
-                &[scope_val] as *const Value,
-                1,
+                run_args.as_ptr(),
+                run_args.len() as u32,
             );
             // Restore interpreter state corrupted by the re-entrant call.
             // vtx_interp_run sets interp->running = false on return, which

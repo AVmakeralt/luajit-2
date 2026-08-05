@@ -294,8 +294,14 @@ pub fn compile(rt: &Runtime, chunk: &Node) -> Result<Compiled, String> {
 }
 
 /// Compile a function body into a separate bytecode module.
+/// Uses VORTEX locals (same as main chunk) for speed.
+/// local 0 = env (globals table), local 1..n = parameters.
 pub fn compile_function_body(rt: &Runtime, proto: &FuncProto) -> Result<Compiled, String> {
-    let mut f = FuncCg::new(true); // function body: scope-table model
+    let mut f = FuncCg::new(false); // use VORTEX locals, NOT scope tables
+    // Declare parameters as locals 1..n (local 0 is the env)
+    for param in &proto.params {
+        f.declare_local(param);
+    }
     for stmt in &proto.body {
         compile_stmt(rt, &mut f, stmt);
         if f.error.is_some() { break; }
@@ -388,15 +394,31 @@ fn compile_local(rt: &Runtime, f: &mut FuncCg, names: &[String], vals: &[Node]) 
 }
 
 fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node]) {
+    // Lua's multiple assignment: evaluate ALL RHS values first, store in temps,
+    // then assign. This is critical for `a,b = b,a+b` to work correctly.
+    let ntargets = targets.len();
+    let nvals = vals.len();
+    let mut temp_slots = Vec::with_capacity(ntargets);
+
+    // Evaluate all RHS values into temp locals
+    for i in 0..ntargets {
+        if i < nvals {
+            compile_expr(rt, f, &vals[i]);
+        } else {
+            f.emit_op(op::LOAD_NULL); f.push1();
+        }
+        let tmp = f.alloc_temp();
+        f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
+        temp_slots.push(tmp);
+    }
+
+    // Now assign each target from its temp
     for (i, target) in targets.iter().enumerate() {
-        let val = vals.get(i);
+        let tmp = temp_slots[i];
         match target {
             Node::Name(_, name) => {
-                if let Some(v) = val {
-                    compile_expr(rt, f, v);
-                } else {
-                    f.emit_op(op::LOAD_NULL); f.push1();
-                }
+                // Load the pre-evaluated value from temp
+                f.emit_op(op::LOAD_LOCAL); f.emit_u16(tmp); f.push1();
                 if f.use_scope_table {
                     // Function body: ScopeSet
                     let tmp = f.alloc_temp();
@@ -430,10 +452,9 @@ fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node])
                 }
             }
             Node::Field(_, obj, field_name) => {
-                // t.name = value
-                if let Some(v) = val { compile_expr(rt, f, v); }
-                else { f.emit_op(op::LOAD_NULL); f.push1(); }
-                let tmp = f.alloc_temp();
+                // t.name = value (value already in temp)
+                f.emit_op(op::LOAD_LOCAL); f.emit_u16(tmp); f.push1();
+                let val_tmp = f.alloc_temp();
                 f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
                 compile_expr(rt, f, obj);
                 let ni = f.const_add_str(rt, field_name.as_bytes());
@@ -443,9 +464,9 @@ fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node])
                 f.emit_op(op::POP); f.pop1();
             }
             Node::Index(_, obj, key) => {
-                if let Some(v) = val { compile_expr(rt, f, v); }
-                else { f.emit_op(op::LOAD_NULL); f.push1(); }
-                let tmp = f.alloc_temp();
+                // t[k] = value (value already in temp)
+                f.emit_op(op::LOAD_LOCAL); f.emit_u16(tmp); f.push1();
+                let val_tmp = f.alloc_temp();
                 f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
                 compile_expr(rt, f, obj);
                 compile_expr(rt, f, key);
