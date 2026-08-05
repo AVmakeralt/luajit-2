@@ -34,6 +34,21 @@ extern "C" {
     fn vtx_runtime_interp(rt: *mut c_void) -> *mut c_void;
 }
 
+/// VORTEX method descriptor (must match runtime/type_system.h).
+/// Allocated on the heap to register Lua functions as VORTEX methods,
+/// enabling native CALL_STATIC dispatch (zero FFI for calls).
+#[repr(C)]
+pub struct VtxMethodDesc {
+    pub name: *const u8,
+    pub signature: *const u8,
+    pub bytecode: *mut VtxBytecode,
+    pub compiled_code: *mut c_void,
+    pub vtable_index: u32,
+    pub arg_count: u32,
+    pub method_symbol_id: u32,
+    pub is_virtual: bool,
+}
+
 /// The VORTEX interpreter struct (partial — we only need running and current_frame).
 /// Field offsets must match vtx_interp_t in interp/dispatch.h.
 #[repr(C)]
@@ -154,13 +169,15 @@ pub enum FnId {
 pub struct Runtime {
     vrt_ptr: *mut c_void,
     callback_registered: bool,
-    /// Cached env value (globals table as NaN-boxed heap pointer).
-    /// Avoids re-creating on every function call.
     env_val: Value,
     pub globals: Rc<LuaTable>,
     pub strings: RefCell<Vec<Box<LuaString>>>,
     pub protos: RefCell<Vec<FuncProto>>,
     pub proto_bytecode: RefCell<HashMap<i32, Box<BytecodeBuf>>>,
+    /// Maps proto_id → constant pool value (NaN-boxed VtxMethodDesc*).
+    /// Used by codegen to emit CALL_STATIC for calls to known functions,
+    /// including recursive calls inside the function body itself.
+    pub method_descs: RefCell<HashMap<i32, Value>>,
     pub modules: RefCell<HashMap<String, Value>>,
     pub error_msg: RefCell<Option<String>>,
     pub search_paths: RefCell<Vec<std::path::PathBuf>>,
@@ -196,6 +213,7 @@ impl Runtime {
             strings: RefCell::new(Vec::new()),
             protos: RefCell::new(Vec::new()),
             proto_bytecode: RefCell::new(HashMap::new()),
+            method_descs: RefCell::new(HashMap::new()),
             modules: RefCell::new(HashMap::new()),
             error_msg: RefCell::new(None),
             search_paths: RefCell::new(vec![
@@ -324,6 +342,34 @@ impl Runtime {
             _consts: compiled.constants,
         };
         self.proto_bytecode.borrow_mut().insert(proto_id, Box::new(buf));
+    }
+
+    /// Create a VORTEX method descriptor for a Lua function and return
+    /// it as a NaN-boxed heap pointer. This can be stored in a constant
+    /// pool and used with CALL_STATIC for zero-FFI function calls.
+    /// Also registers it in the runtime's method_descs map so that
+    /// recursive calls (inside the function body) can find it.
+    pub fn create_method_desc(&self, proto_id: i32, nparams: u32) -> Value {
+        let bc_ptr = self.get_proto_bytecode(proto_id).unwrap_or(std::ptr::null_mut());
+        let md = Box::new(VtxMethodDesc {
+            name: b"lua_fn\0".as_ptr(),
+            signature: b"(I)I\0".as_ptr(),
+            bytecode: bc_ptr,
+            compiled_code: std::ptr::null_mut(),
+            vtable_index: proto_id as u32,
+            arg_count: nparams + 1, // +1 for env (local 0)
+            method_symbol_id: 0,
+            is_virtual: false,
+        });
+        let raw = Box::into_raw(md) as *mut c_void;
+        let val = unsafe { make_heap_ptr(raw) };
+        self.method_descs.borrow_mut().insert(proto_id, val);
+        val
+    }
+
+    /// Get a method descriptor value by proto_id (for recursive calls).
+    pub fn get_method_desc(&self, proto_id: i32) -> Option<Value> {
+        self.method_descs.borrow().get(&proto_id).copied()
     }
 
     /// Get the bytecode pointer for a proto.

@@ -106,6 +106,15 @@ struct FuncCg {
     error: Option<String>,
     /// Local variable name→slot mappings (for the main chunk's VORTEX locals).
     locals: Vec<(String, u16)>,
+    /// Maps local slot → constant pool index of the method descriptor.
+    /// When a local function is declared, we create a VtxMethodDesc,
+    /// store it in the constant pool, and record the mapping here.
+    /// This enables CALL_STATIC dispatch (zero FFI for function calls).
+    method_descs: std::collections::HashMap<u16, u16>,
+    /// When compile_function creates a method descriptor, it stores the
+    /// constant pool index here. compile_local picks this up and registers
+    /// it in method_descs, associating the local slot with the method desc.
+    pending_method_desc: Option<u16>,
 }
 
 impl FuncCg {
@@ -126,6 +135,8 @@ impl FuncCg {
             loop_depth: 0,
             error: None,
             locals: Vec::new(),
+            method_descs: std::collections::HashMap::new(),
+            pending_method_desc: None,
         };
         f
     }
@@ -389,6 +400,12 @@ fn compile_local(rt: &Runtime, f: &mut FuncCg, names: &[String], vals: &[Node]) 
             f.emit_op(op::LOAD_LOCAL); f.emit_u16(slot); f.push1();
             f.emit_lua_call(FnId::GlobalSet, 3);
             f.emit_op(op::POP); f.pop1();
+
+            // If compile_function created a method descriptor, register it
+            // for this local slot so compile_call can use CALL_STATIC.
+            if let Some(md_idx) = f.pending_method_desc.take() {
+                f.method_descs.insert(slot, md_idx);
+            }
         }
     }
 }
@@ -925,6 +942,47 @@ fn compile_unop(rt: &Runtime, f: &mut FuncCg, op: &UnOp, operand: &Node) {
 }
 
 fn compile_call(rt: &Runtime, f: &mut FuncCg, callee: &Node, args: &[Node]) {
+    // Fast path: if calling a known local function, use CALL_STATIC
+    // (zero FFI — VORTEX handles frame creation + dispatch entirely in C).
+    if let Node::Name(_, name) = callee {
+        // Check if this local has an associated method descriptor in this FuncCg
+        let md_idx = f.lookup_local(name).and_then(|slot| f.method_descs.get(&slot).copied());
+
+        // Also check if this name is a known function via the runtime's
+        // method_descs map (for recursive calls inside function bodies).
+        // We look up the proto by name in the runtime's protos list.
+        let md_idx = md_idx.or_else(|| {
+            // Search protos for one with a matching name
+            let protos = rt.protos.borrow();
+            for (i, p) in protos.iter().enumerate() {
+                if p.name.as_deref() == Some(name.as_str()) {
+                    if let Some(md_val) = rt.get_method_desc(i as i32) {
+                        // Store the method desc value in this FuncCg's constant pool
+                        let idx = f.constants.len() as u16;
+                        f.constants.push(md_val);
+                        return Some(idx);
+                    }
+                }
+            }
+            None
+        });
+
+        if let Some(md_const_idx) = md_idx {
+            // Push env (local 0) + args onto the stack
+            f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
+            for a in args {
+                compile_expr(rt, f, a);
+            }
+            // CALL_STATIC: pops (1 + args.len()) values, pushes 1 result
+            f.emit_op(op::CALL_STATIC);
+            f.emit_u16(md_const_idx);
+            for _ in 0..(1 + args.len()) { f.pop1(); }
+            f.push1();
+            return;
+        }
+    }
+
+    // Fallback: dynamic call via callback
     compile_expr(rt, f, callee);
     for a in args {
         compile_expr(rt, f, a);
@@ -954,9 +1012,24 @@ fn compile_function(rt: &Runtime, f: &mut FuncCg, proto: &FuncProto) {
             return;
         }
     }
+
+    // Create a VORTEX method descriptor and store it in the constant pool.
+    // This enables CALL_STATIC dispatch for calls to this function.
+    let nparams = proto.params.len() as u32;
+    let md_val = rt.create_method_desc(proto_id, nparams);
+    let md_const_idx = f.constants.len();
+    f.constants.push(md_val);
+
     // Emit: new_closure_with_env(proto_id, env)
     let pi = f.const_add_int(proto_id as i64);
     f.emit_op(op::LOAD_CONST_INT); f.emit_u16(pi); f.push1();
     f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
     f.emit_lua_call(FnId::NewClosureWithEnv, 2);
+
+    // If this function is being assigned to a local variable (via
+    // compile_local), the caller will store the result. We record
+    // the method descriptor index so compile_call can use CALL_STATIC.
+    // The association is done in compile_local when it detects a
+    // Function node as the value.
+    f.pending_method_desc = Some(md_const_idx as u16);
 }
