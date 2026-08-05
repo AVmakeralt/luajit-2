@@ -1,10 +1,2 @@
-build/
-*.o
-*.a
-*.so
-*.dylib
-.vscode/
-.idea/
-*.swp
-*~
-.DS_Store
+/target
+Cargo.lock
