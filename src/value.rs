@@ -403,7 +403,10 @@ pub fn to_lua_string(v: Value) -> Vec<u8> {
     if is_smi(v) { return format!("{}", smi_value(v)).into_bytes(); }
     if is_double(v) {
         let d = double_value(v);
-        return format!("{:.14e}", d).into_bytes(); // simplified
+        if d.fract() == 0.0 && d.abs() < 1e15 {
+            return format!("{}", d as i64).into_bytes();
+        }
+        return format!("{}", d).into_bytes();
     }
     if let Some(s) = as_string(v) { return s.data.clone(); }
     if is_table(v) {

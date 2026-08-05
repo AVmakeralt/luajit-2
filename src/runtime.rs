@@ -9,7 +9,58 @@ use std::os::raw::c_void;
 use std::collections::HashMap;
 use std::cell::RefCell;
 use std::rc::Rc;
-use vortex::Runtime as VortexRT;
+
+// The VORTEX runtime struct — we allocate it directly on the heap to
+// avoid move-related dangling pointer issues (the runtime has
+// self-referential pointers like interp->gc = &rt->gc).
+#[repr(C)]
+pub struct VtxRuntime {
+    type_system: [u8; 512],  // vtx_type_system_t (oversized to be safe)
+    gc: [u8; 512],           // vtx_gc_t (oversized)
+    interp: *mut c_void,
+    // ... more fields follow, but we only need the pointer
+}
+
+extern "C" {
+    fn vtx_runtime_create(rt: *mut c_void) -> i32;
+    fn vtx_runtime_destroy(rt: *mut c_void);
+    fn vtx_runtime_enable_jit(rt: *mut c_void, nthreads: u32);
+    fn vtx_runtime_run_with_args(
+        rt: *mut c_void,
+        bc: *const VtxBytecode,
+        args: *const Value,
+        arg_count: u32,
+    ) -> Value;
+    fn vtx_runtime_interp(rt: *mut c_void) -> *mut c_void;
+}
+
+/// The VORTEX interpreter struct (partial — we only need running and current_frame).
+/// Field offsets must match vtx_interp_t in interp/dispatch.h.
+#[repr(C)]
+struct VtxInterpState {
+    _frame_stack: [u8; 64],  // vtx_frame_stack_t (oversized)
+    current_frame: *mut c_void,
+    // ... more fields between current_frame and running ...
+    // We'll compute the running offset dynamically
+}
+
+/// After a re-entrant `vtx_runtime_run_with_args` call (from within a
+/// callback), the function's `vtx_interp_run` sets `interp->running = false`
+/// and `interp->current_frame = NULL`. This corrupts the main chunk's
+/// interpreter state. We restore `running = true` after the re-entrant call.
+///
+/// The `running` field offset in `vtx_interp_t` is computed from the FFI
+/// bindings' struct layout:
+///   frame_stack(24) + current_frame(8) + profiler(144) + type_feedback(48)
+///   + type_system(8) + gc(8) + compile_ctx(8) + dispatch_table(8) = 256
+const INTERP_RUNNING_OFFSET: usize = 256;
+
+unsafe fn restore_interp_running(vrt_ptr: *mut c_void) {
+    let interp = vtx_runtime_interp(vrt_ptr);
+    if !interp.is_null() {
+        *(interp as *mut u8).add(INTERP_RUNNING_OFFSET) = 1; // running = true
+    }
+}
 
 // The VORTEX bytecode struct layout (must match runtime/bytecode.h).
 #[repr(C)]
@@ -37,16 +88,6 @@ impl Drop for BytecodeBuf {
             }
         }
     }
-}
-
-// FFI for the VORTEX runtime's run_with_args.
-extern "C" {
-    fn vtx_runtime_run_with_args(
-        rt: *mut c_void,
-        bc: *const VtxBytecode,
-        args: *const Value,
-        arg_count: u32,
-    ) -> Value;
 }
 
 /// Lua stdlib function IDs (packed into CALL_RUNTIME operands as
@@ -111,12 +152,12 @@ pub enum FnId {
 /// The LuaVortex runtime. Wraps a VORTEX runtime and provides the
 /// Lua stdlib.
 pub struct Runtime {
-    pub vrt: VortexRT,
+    /// Heap-allocated VORTEX runtime. MUST NOT move after initialization
+    /// because it contains self-referential pointers (interp->gc = &rt->gc).
+    vrt_ptr: *mut c_void,
     pub globals: Rc<LuaTable>,
     pub strings: RefCell<Vec<Box<LuaString>>>,
     pub protos: RefCell<Vec<FuncProto>>,
-    /// Compiled bytecode buffers, kept alive for the runtime's lifetime.
-    /// Keyed by proto_id. The BytecodeBuf owns the code/constant Vecs.
     pub proto_bytecode: RefCell<HashMap<i32, Box<BytecodeBuf>>>,
     pub modules: RefCell<HashMap<String, Value>>,
     pub error_msg: RefCell<Option<String>>,
@@ -127,10 +168,25 @@ unsafe impl Send for Runtime {}
 
 impl Runtime {
     pub fn new() -> Result<Self, String> {
-        let vrt = VortexRT::new()?;
+        // Allocate the VORTEX runtime on the heap so it never moves.
+        // The vtx_runtime_t struct is large (~several KB). We allocate
+        // via Box<[u8]> with a generous size, then cast.
+        // The actual size doesn't matter as long as it's large enough —
+        // vtx_runtime_create will initialize the fields.
+        let layout = std::alloc::Layout::from_size_align(16384, 8).unwrap();
+        let vrt_ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut c_void };
+        if vrt_ptr.is_null() {
+            return Err("failed to allocate VORTEX runtime".to_string());
+        }
+        let rc = unsafe { vtx_runtime_create(vrt_ptr) };
+        if rc != 0 {
+            unsafe { std::alloc::dealloc(vrt_ptr as *mut u8, layout); }
+            return Err("failed to create VORTEX runtime".to_string());
+        }
+
         let globals = LuaTable::new();
         let rt = Runtime {
-            vrt,
+            vrt_ptr,
             globals,
             strings: RefCell::new(Vec::new()),
             protos: RefCell::new(Vec::new()),
@@ -144,6 +200,11 @@ impl Runtime {
         };
         stdlib::register(&rt);
         Ok(rt)
+    }
+
+    /// Enable JIT compilation.
+    pub fn enable_jit(&mut self, nthreads: u32) {
+        unsafe { vtx_runtime_enable_jit(self.vrt_ptr, nthreads); }
     }
 
     /// Run a Lua source string.
@@ -182,7 +243,7 @@ impl Runtime {
         vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
 
         let env_val = make_table(self.globals.clone());
-        let vrt_ptr = self.vrt.as_ptr() as *mut c_void;
+        let vrt_ptr = self.vrt_ptr;
         let result = unsafe {
             vtx_runtime_run_with_args(
                 vrt_ptr,
@@ -329,23 +390,39 @@ impl Runtime {
         // has `inner: ffi::vtx_runtime_t` as its only field. A pointer
         // to the vortex::Runtime IS a pointer to the inner runtime
         // (same address, since it's the first and only field).
-        let vrt_ptr = &self.vrt as *const VortexRT as *mut c_void;
+        let vrt_ptr = self.vrt_ptr;
         vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
-        unsafe {
-            let result = vtx_runtime_run_with_args(
+        let result = unsafe {
+            let r = vtx_runtime_run_with_args(
                 vrt_ptr,
                 bc_ptr,
                 &[scope_val] as *const Value,
                 1,
             );
-            vortex::set_runtime_callback(None, std::ptr::null_mut());
-            result
-        }
+            // Restore interpreter state corrupted by the re-entrant call.
+            // vtx_interp_run sets interp->running = false on return, which
+            // stops the main chunk's interpreter. We set it back to true.
+            restore_interp_running(vrt_ptr);
+            r
+        };
+        // Re-register the callback for the main chunk's continued execution
+        vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
+        result
     }
 
     /// Add a search path for require().
     pub fn add_search_path(&self, path: impl Into<std::path::PathBuf>) {
         self.search_paths.borrow_mut().push(path.into());
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        unsafe {
+            vtx_runtime_destroy(self.vrt_ptr);
+            let layout = std::alloc::Layout::from_size_align(16384, 8).unwrap();
+            std::alloc::dealloc(self.vrt_ptr as *mut u8, layout);
+        }
     }
 }
 
@@ -370,9 +447,9 @@ extern "C" fn dispatch_callback(
         unsafe {
             let stack_ptr = *sp;
             for i in 0..argc {
-                argv_buf[i] = *stack_ptr.sub(argc - i);
+                argv_buf[i] = *stack_ptr.wrapping_sub(argc - i);
             }
-            *sp = stack_ptr.sub(argc);
+            *sp = stack_ptr.wrapping_sub(argc);
         }
     }
 
@@ -383,7 +460,7 @@ extern "C" fn dispatch_callback(
     unsafe {
         let stack_ptr = *sp;
         *stack_ptr = result;
-        *sp = stack_ptr.add(1);
+        *sp = stack_ptr.wrapping_add(1);
     }
 
     1 // pushed 1 value

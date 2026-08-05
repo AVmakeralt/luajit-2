@@ -145,6 +145,17 @@ impl FuncCg {
         None
     }
 
+    /// Allocate a temp local slot. These are never looked up by name;
+    /// they're used for intermediate values during expression evaluation.
+    /// The slot is "leaked" (never reclaimed) but that's fine — the frame
+    /// is allocated once based on max_locals.
+    fn alloc_temp(&mut self) -> u16 {
+        let slot = self.next_local;
+        self.next_local += 1;
+        if self.next_local > self.max_locals { self.max_locals = self.next_local; }
+        slot
+    }
+
     fn emit_byte(&mut self, b: u8) {
         self.code.push(b);
     }
@@ -246,6 +257,7 @@ impl FuncCg {
         for (off, target) in &jumps {
             let pc = self.label_target(*target);
             self.patch_u16(*off, pc as u16);
+            
         }
     }
 
@@ -272,11 +284,12 @@ pub fn compile(rt: &Runtime, chunk: &Node) -> Result<Compiled, String> {
     }
     f.emit_op(op::RETURN);
     f.resolve_jumps();
+    
     Ok(Compiled {
         code: f.code,
         constants: f.constants,
-        max_locals: f.next_local.max(8),
-        max_stack: f.max_stack.max(16),
+        max_locals: f.next_local.max(64),
+        max_stack: f.max_stack.max(256),
     })
 }
 
@@ -348,8 +361,7 @@ fn compile_local(rt: &Runtime, f: &mut FuncCg, names: &[String], vals: &[Node]) 
         }
         if f.use_scope_table {
             // scope_declare(env, name, value)
-            let tmp = f.next_local; f.next_local += 1;
-            if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+            let tmp = f.alloc_temp();
             f.emit_op(op::STORE_LOCAL);
             f.emit_u16(tmp);
             f.pop1();
@@ -386,8 +398,8 @@ fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node])
                     f.emit_op(op::LOAD_NULL); f.push1();
                 }
                 if f.use_scope_table {
-                    let tmp = f.next_local; f.next_local += 1;
-                    if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+                    // Function body: ScopeSet
+                    let tmp = f.alloc_temp();
                     f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
                     f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
                     let ni = f.const_add_str(rt, name.as_bytes());
@@ -395,10 +407,19 @@ fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node])
                     f.emit_op(op::LOAD_LOCAL); f.emit_u16(tmp); f.push1();
                     f.emit_lua_call(FnId::ScopeSet, 3);
                     f.emit_op(op::POP); f.pop1();
+                } else if let Some(slot) = f.lookup_local(name) {
+                    // Main chunk: assign to existing VORTEX local
+                    f.emit_op(op::STORE_LOCAL); f.emit_u16(slot); f.pop1();
+                    // Also update global env so closures see the new value
+                    f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
+                    let ni = f.const_add_str(rt, name.as_bytes());
+                    f.emit_op(op::LOAD_CONST_STR); f.emit_u16(ni); f.push1();
+                    f.emit_op(op::LOAD_LOCAL); f.emit_u16(slot); f.push1();
+                    f.emit_lua_call(FnId::GlobalSet, 3);
+                    f.emit_op(op::POP); f.pop1();
                 } else {
-                    // Main chunk: store in global env (all main-chunk vars are "global" to closures)
-                    let tmp = f.next_local; f.next_local += 1;
-                    if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+                    // Main chunk: global assignment (not a local)
+                    let tmp = f.alloc_temp();
                     f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
                     f.emit_op(op::LOAD_LOCAL); f.emit_u16(f.env_slot); f.push1();
                     let ni = f.const_add_str(rt, name.as_bytes());
@@ -412,8 +433,7 @@ fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node])
                 // t.name = value
                 if let Some(v) = val { compile_expr(rt, f, v); }
                 else { f.emit_op(op::LOAD_NULL); f.push1(); }
-                let tmp = f.next_local; f.next_local += 1;
-                if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+                let tmp = f.alloc_temp();
                 f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
                 compile_expr(rt, f, obj);
                 let ni = f.const_add_str(rt, field_name.as_bytes());
@@ -425,8 +445,7 @@ fn compile_assign(rt: &Runtime, f: &mut FuncCg, targets: &[Node], vals: &[Node])
             Node::Index(_, obj, key) => {
                 if let Some(v) = val { compile_expr(rt, f, v); }
                 else { f.emit_op(op::LOAD_NULL); f.push1(); }
-                let tmp = f.next_local; f.next_local += 1;
-                if f.next_local > f.max_locals { f.max_locals = f.next_local; }
+                let tmp = f.alloc_temp();
                 f.emit_op(op::STORE_LOCAL); f.emit_u16(tmp); f.pop1();
                 compile_expr(rt, f, obj);
                 compile_expr(rt, f, key);

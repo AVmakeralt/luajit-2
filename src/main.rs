@@ -56,7 +56,7 @@ fn main() {
     };
 
     if use_jit {
-        rt.vrt.enable_jit(2);
+        rt.enable_jit(2);
     }
 
     let mut rc = 0;
