@@ -148,6 +148,7 @@ pub fn dispatch(rt: &Runtime, fn_id: u16, args: Args) -> Value {
                 let mut f = LuaFunction::new_lua(proto_id);
                 f.captured_env = Some(env);
                 f.compiled_bc = rt.get_proto_bytecode(proto_id).map(|p| p as *mut c_void);
+                f.nparams = rt.get_proto(proto_id).map(|p| p.params.len() as u32).unwrap_or(0);
                 return make_function(f);
             }
             NULL

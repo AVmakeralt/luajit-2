@@ -269,8 +269,10 @@ pub struct LuaFunction {
     pub _mark: u32,
     pub proto_id: i32,
     pub native: Option<NativeFn>,
-    pub captured_env: Option<Value>,  // a LuaTable value
-    pub compiled_bc: Option<*mut c_void>,  // raw pointer to vtx_bytecode_t
+    pub captured_env: Option<Value>,
+    pub compiled_bc: Option<*mut c_void>,
+    /// Cached param count — avoids RefCell borrow + Vec lookup on every call.
+    pub nparams: u32,
 }
 
 /// Native function type: takes (args, rt_ptr) and returns a Value.
@@ -288,6 +290,7 @@ impl LuaFunction {
             native: None,
             captured_env: None,
             compiled_bc: None,
+            nparams: 0,
         })
     }
 
@@ -299,6 +302,7 @@ impl LuaFunction {
             native: Some(fn_ptr),
             captured_env: None,
             compiled_bc: None,
+            nparams: 0,
         })
     }
 }

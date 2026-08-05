@@ -549,10 +549,10 @@ fn compile_for_num(rt: &Runtime, f: &mut FuncCg, name: &str, init: &Node, limit:
     let end = f.label_alloc();
     f.label_place(start);
 
-    // Condition: limit < v (i.e. v > limit)
+    // Condition: limit < v (i.e. v > limit) — use native ICMP_LT
     f.emit_op(op::LOAD_LOCAL); f.emit_u16(limit_slot); f.push1();
     f.emit_op(op::LOAD_LOCAL); f.emit_u16(v_slot); f.push1();
-    f.emit_lua_call(FnId::CmpLt, 2);
+    f.emit_op(op::ICMP_LT); f.pop1(); f.pop1(); f.push1();
     f.emit_if_true(end);
 
     f.loop_depth += 1;
@@ -574,10 +574,10 @@ fn compile_for_num(rt: &Runtime, f: &mut FuncCg, name: &str, init: &Node, limit:
     f.break_labels.pop();
     f.loop_depth -= 1;
 
-    // v = v + step
+    // v = v + step — use native IADD
     f.emit_op(op::LOAD_LOCAL); f.emit_u16(v_slot); f.push1();
     f.emit_op(op::LOAD_LOCAL); f.emit_u16(step_slot); f.push1();
-    f.emit_lua_call(FnId::ArithAdd, 2);
+    f.emit_op(op::IADD); f.pop1(); f.pop1(); f.push1();
     f.emit_op(op::STORE_LOCAL); f.emit_u16(v_slot); f.pop1();
     f.emit_goto(start);
     f.label_place(end);
@@ -823,46 +823,63 @@ fn compile_binop(rt: &Runtime, f: &mut FuncCg, op: &BinOp, l: &Node, r: &Node) {
         _ => {
             compile_expr(rt, f, l);
             compile_expr(rt, f, r);
-            let fn_id = match op {
-                BinOp::Add => FnId::ArithAdd,
-                BinOp::Sub => FnId::ArithSub,
-                BinOp::Mul => FnId::ArithMul,
-                BinOp::Div => FnId::ArithDiv,
-                BinOp::IDiv => FnId::ArithIDiv,
-                BinOp::Mod => FnId::ArithMod,
-                BinOp::Pow => FnId::ArithPow,
-                BinOp::Concat => FnId::ArithConcat,
-                BinOp::Eq => FnId::CmpEq,
-                BinOp::Ne => FnId::CmpEq, // negate below
-                BinOp::Lt => FnId::CmpLt,
-                BinOp::Le => FnId::CmpLe,
-                BinOp::Gt => FnId::CmpLt, // swap
-                BinOp::Ge => FnId::CmpLe, // swap
-                BinOp::BAnd => FnId::BitAnd,
-                BinOp::BOr => FnId::BitOr,
-                BinOp::BXor => FnId::BitXor,
-                BinOp::Shl => FnId::BitShl,
-                BinOp::Shr => FnId::BitShr,
+
+            // Use native VORTEX opcodes for hot operations (zero FFI overhead).
+            // VORTEX's IADD/ISUB/IMUL handle SMI fast-path + double fallback,
+            // which matches Lua's arithmetic semantics.
+            // ICMP_* handle both SMI and double comparisons.
+            match op {
+                BinOp::Add => {
+                    f.emit_op(op::IADD); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Sub => {
+                    f.emit_op(op::ISUB); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Mul => {
+                    f.emit_op(op::IMUL); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Lt => {
+                    f.emit_op(op::ICMP_LT); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Le => {
+                    f.emit_op(op::ICMP_LE); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Gt => {
+                    // a > b  →  b < a  (swap then ICMP_LT)
+                    f.emit_op(op::SWAP);
+                    f.emit_op(op::ICMP_LT); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Ge => {
+                    // a >= b  →  b <= a  (swap then ICMP_LE)
+                    f.emit_op(op::SWAP);
+                    f.emit_op(op::ICMP_LE); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Eq => {
+                    f.emit_op(op::ICMP_EQ); f.pop1(); f.pop1(); f.push1();
+                }
+                BinOp::Ne => {
+                    f.emit_op(op::ICMP_NE); f.pop1(); f.pop1(); f.push1();
+                }
+                // These operations have different Lua semantics, keep callback
+                BinOp::Div | BinOp::IDiv | BinOp::Mod | BinOp::Pow |
+                BinOp::Concat | BinOp::BAnd | BinOp::BOr | BinOp::BXor |
+                BinOp::Shl | BinOp::Shr => {
+                    let fn_id = match op {
+                        BinOp::Div => FnId::ArithDiv,
+                        BinOp::IDiv => FnId::ArithIDiv,
+                        BinOp::Mod => FnId::ArithMod,
+                        BinOp::Pow => FnId::ArithPow,
+                        BinOp::Concat => FnId::ArithConcat,
+                        BinOp::BAnd => FnId::BitAnd,
+                        BinOp::BOr => FnId::BitOr,
+                        BinOp::BXor => FnId::BitXor,
+                        BinOp::Shl => FnId::BitShl,
+                        BinOp::Shr => FnId::BitShr,
+                        _ => unreachable!(),
+                    };
+                    f.emit_lua_call(fn_id, 2);
+                }
                 BinOp::And | BinOp::Or => unreachable!(),
-            };
-            if matches!(op, BinOp::Gt | BinOp::Ge) {
-                // Swap operands: emit SWAP before the call
-                f.emit_op(op::SWAP);
-            }
-            f.emit_lua_call(fn_id, 2);
-            if matches!(op, BinOp::Ne) {
-                // Negate the boolean result
-                let true_l = f.label_alloc();
-                let end_l = f.label_alloc();
-                f.emit_op(op::DUP); f.push1();
-                f.emit_if_true(true_l);
-                f.emit_op(op::POP); f.pop1();
-                f.emit_op(op::LOAD_TRUE); f.push1();
-                f.emit_goto(end_l);
-                f.label_place(true_l);
-                f.emit_op(op::POP); f.pop1();
-                f.emit_op(op::LOAD_FALSE); f.push1();
-                f.label_place(end_l);
             }
         }
     }

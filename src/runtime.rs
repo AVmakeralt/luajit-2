@@ -152,9 +152,11 @@ pub enum FnId {
 /// The LuaVortex runtime. Wraps a VORTEX runtime and provides the
 /// Lua stdlib.
 pub struct Runtime {
-    /// Heap-allocated VORTEX runtime. MUST NOT move after initialization
-    /// because it contains self-referential pointers (interp->gc = &rt->gc).
     vrt_ptr: *mut c_void,
+    callback_registered: bool,
+    /// Cached env value (globals table as NaN-boxed heap pointer).
+    /// Avoids re-creating on every function call.
+    env_val: Value,
     pub globals: Rc<LuaTable>,
     pub strings: RefCell<Vec<Box<LuaString>>>,
     pub protos: RefCell<Vec<FuncProto>>,
@@ -185,8 +187,11 @@ impl Runtime {
         }
 
         let globals = LuaTable::new();
+        let env_val = make_table(globals.clone());
         let rt = Runtime {
             vrt_ptr,
+            callback_registered: false,
+            env_val,
             globals,
             strings: RefCell::new(Vec::new()),
             protos: RefCell::new(Vec::new()),
@@ -207,6 +212,16 @@ impl Runtime {
         unsafe { vtx_runtime_enable_jit(self.vrt_ptr, nthreads); }
     }
 
+    /// Register the callback lazily on first use. Must be called when
+    /// `self` is in its final location (not on the stack of `new()`).
+    fn ensure_callback(&mut self) {
+        if !self.callback_registered {
+            let rt_ptr = self as *mut Runtime as *mut c_void;
+            vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
+            self.callback_registered = true;
+        }
+    }
+
     /// Run a Lua source string.
     pub fn run_source(&mut self, src: &str) -> Result<Value, String> {
         self.run_source_named("(string)", src)
@@ -214,6 +229,7 @@ impl Runtime {
 
     /// Run a Lua source string with a name (for error messages).
     pub fn run_source_named(&mut self, name: &str, src: &str) -> Result<Value, String> {
+        self.ensure_callback();
         let mut parser = crate::parser::Parser::new(src, name);
         let chunk = parser.parse().ok_or_else(|| {
             parser.last_error.clone().unwrap_or_else(|| "unknown parse error".to_string())
@@ -238,12 +254,9 @@ impl Runtime {
             _consts: compiled.constants,
         }));
 
-        // Register the runtime callback
-        let rt_ptr = self as *mut Runtime as *mut c_void;
-        vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
-
-        let env_val = make_table(self.globals.clone());
+        // Callback is registered once — no per-call registration
         let vrt_ptr = self.vrt_ptr;
+        let env_val = self.env_val;
         let result = unsafe {
             vtx_runtime_run_with_args(
                 vrt_ptr,
@@ -252,8 +265,6 @@ impl Runtime {
                 1,
             )
         };
-
-        vortex::set_runtime_callback(None, std::ptr::null_mut());
 
         // Clean up the main chunk bytecode
         self.proto_bytecode.borrow_mut().remove(&-1);
@@ -351,56 +362,40 @@ impl Runtime {
             return native_fn(args, rt_ptr);
         }
 
-        let proto_id = f.proto_id;
-        if proto_id < 0 {
-            *self.error_msg.borrow_mut() = Some(format!("invalid proto id {}", proto_id));
-            return NULL;
-        }
-
-        let bc_ptr = match self.get_proto_bytecode(proto_id) {
-            Some(p) => p,
+        // Fast path: use cached bc_ptr and nparams from the LuaFunction struct.
+        // This avoids RefCell borrows + HashMap lookups on every call.
+        let bc_ptr = match f.compiled_bc {
+            Some(p) => p as *const VtxBytecode,
             None => {
-                *self.error_msg.borrow_mut() = Some(format!("no bytecode for proto {}", proto_id));
-                return NULL;
+                // Fallback: look up in the proto_bytecode map
+                match self.get_proto_bytecode(f.proto_id) {
+                    Some(p) => p,
+                    None => {
+                        *self.error_msg.borrow_mut() = Some(format!("no bytecode for proto {}", f.proto_id));
+                        return NULL;
+                    }
+                }
             }
         };
 
-        let proto = match self.get_proto(proto_id) {
-            Some(p) => p,
-            None => {
-                *self.error_msg.borrow_mut() = Some(format!("no proto {}", proto_id));
-                return NULL;
-            }
-        };
-
-        // Build the args array: [env_table, param1, param2, ...]
-        // local 0 = env (globals table), local 1..n = parameters
-        let env_val = make_table(self.globals.clone());
-        let mut run_args = Vec::with_capacity(1 + proto.params.len());
-        run_args.push(env_val);
-        for i in 0..proto.params.len() {
-            run_args.push(args.get(i).copied().unwrap_or(NULL));
+        let nparams = f.nparams as usize;
+        let mut run_args: [Value; 16] = [NULL; 16];
+        run_args[0] = self.env_val;
+        for i in 0..nparams.min(15) {
+            run_args[i + 1] = args.get(i).copied().unwrap_or(NULL);
         }
 
-        let rt_ptr = self as *const Runtime as *mut c_void;
         let vrt_ptr = self.vrt_ptr;
-        vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
-        let result = unsafe {
+        unsafe {
             let r = vtx_runtime_run_with_args(
                 vrt_ptr,
                 bc_ptr,
                 run_args.as_ptr(),
-                run_args.len() as u32,
+                (1 + nparams.min(15)) as u32,
             );
-            // Restore interpreter state corrupted by the re-entrant call.
-            // vtx_interp_run sets interp->running = false on return, which
-            // stops the main chunk's interpreter. We set it back to true.
             restore_interp_running(vrt_ptr);
             r
-        };
-        // Re-register the callback for the main chunk's continued execution
-        vortex::set_runtime_callback(Some(dispatch_callback), rt_ptr);
-        result
+        }
     }
 
     /// Add a search path for require().
@@ -434,19 +429,19 @@ extern "C" fn dispatch_callback(
     let fn_id = (operand >> 6) as u16;
     let argc = (operand & 0x3F) as usize;
 
-    // Pop `argc` values from the stack into an argv buffer.
-    let mut argv_buf = [0u64; 64];
-    if argc > 0 && argc <= 64 {
-        unsafe {
-            let stack_ptr = *sp;
-            for i in 0..argc {
-                argv_buf[i] = *stack_ptr.wrapping_sub(argc - i);
-            }
-            *sp = stack_ptr.wrapping_sub(argc);
+    // Pop `argc` values from the stack. Instead of copying to a buffer,
+    // we create a slice that points directly at the C stack — zero copy.
+    let args: &[Value] = unsafe {
+        let stack_ptr = *sp;
+        let args_ptr = stack_ptr.wrapping_sub(argc);
+        *sp = args_ptr;
+        if argc > 0 {
+            std::slice::from_raw_parts(args_ptr, argc)
+        } else {
+            &[]
         }
-    }
+    };
 
-    let args = &argv_buf[..argc.min(64)];
     let result = stdlib::dispatch(rt, fn_id, args);
 
     // Push the result onto the stack
