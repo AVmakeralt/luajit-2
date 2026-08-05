@@ -4,8 +4,7 @@ A Lua 5.4 frontend for the VORTEX JIT runtime, written in Rust for memory safety
 
 ## Status
 
-**Work in progress.** The Rust port is architecturally complete (lexer, parser, AST, codegen, runtime, stdlib) but has a **known build issue** that prevents runtime execution. See [BUGS.md](BUGS.md) for details.
-
+**Work in progress.** The Rust port is architecturally complete (lexer, parser, AST, codegen, runtime, stdlib), but still neeeds edge case handling
 ## Architecture
 
 ```
