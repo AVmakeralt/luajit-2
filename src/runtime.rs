@@ -32,6 +32,31 @@ extern "C" {
         arg_count: u32,
     ) -> Value;
     fn vtx_runtime_interp(rt: *mut c_void) -> *mut c_void;
+    fn vtx_runtime_compile_ctx(rt: *mut c_void) -> *mut c_void;
+    fn vtx_compile_context_set_method_lookup(
+        ctx: *mut c_void,
+        lookup: Option<extern "C" fn(u32, *mut c_void) -> *const VtxMethodDesc>,
+        context: *mut c_void,
+    );
+    fn vtx_interp_set_compile_ctx(interp: *mut c_void, ctx: *mut c_void);
+    fn vtx_interp_run(
+        interp: *mut c_void,
+        method: *const VtxMethodDesc,
+        args: *const Value,
+        arg_count: u32,
+    ) -> Value;
+}
+
+/// Call vtx_interp_run directly with a heap-allocated method descriptor.
+/// This allows the JIT compiler to write compiled_code to the persistent
+/// method descriptor (instead of a stack-local copy that's lost on return).
+unsafe fn vtx_interp_run_direct(
+    interp: *mut c_void,
+    method: *mut VtxMethodDesc,
+    args: *const Value,
+    arg_count: u32,
+) -> Value {
+    vtx_interp_run(interp, method as *const VtxMethodDesc, args, arg_count)
 }
 
 /// VORTEX method descriptor (must match runtime/type_system.h).
@@ -227,7 +252,26 @@ impl Runtime {
 
     /// Enable JIT compilation.
     pub fn enable_jit(&mut self, nthreads: u32) {
-        unsafe { vtx_runtime_enable_jit(self.vrt_ptr, nthreads); }
+        unsafe {
+            vtx_runtime_enable_jit(self.vrt_ptr, nthreads);
+
+            // Wire the method_lookup callback so the JIT compiler can
+            // find our Lua function method descriptors by vtable_index
+            // (which we set to proto_id). Without this, the compiler
+            // can't find any methods and JIT compilation silently fails.
+            let compile_ctx = vtx_runtime_compile_ctx(self.vrt_ptr);
+            if !compile_ctx.is_null() {
+                vtx_compile_context_set_method_lookup(
+                    compile_ctx,
+                    Some(method_lookup_callback),
+                    self as *mut Runtime as *mut c_void,
+                );
+            }
+            let interp = vtx_runtime_interp(self.vrt_ptr);
+            if !interp.is_null() && !compile_ctx.is_null() {
+                vtx_interp_set_compile_ctx(interp, compile_ctx);
+            }
+        }
     }
 
     /// Register the callback lazily on first use. Must be called when
@@ -265,20 +309,39 @@ impl Runtime {
             max_stack: compiled.max_stack,
         });
         let bc_ptr = Box::into_raw(bc);
-        // Store the buf so the code/constants Vecs stay alive
         self.proto_bytecode.borrow_mut().insert(-1, Box::new(BytecodeBuf {
             ptr: bc_ptr,
             _code: compiled.code,
             _consts: compiled.constants,
         }));
 
-        // Callback is registered once — no per-call registration
+        // Create a PERSISTENT method descriptor for the main chunk.
+        // We can't use vtx_runtime_run_with_args because it creates a
+        // stack-local method descriptor — the JIT compiler writes
+        // compiled_code to that stack copy, which is lost when the
+        // function returns. Instead, we allocate the method descriptor
+        // on the heap and call vtx_interp_run directly.
+        let main_md = Box::new(VtxMethodDesc {
+            name: b"main\0".as_ptr(),
+            signature: b"(I)I\0".as_ptr(),
+            bytecode: bc_ptr,
+            compiled_code: std::ptr::null_mut(),
+            vtable_index: 0,
+            arg_count: 1, // env
+            method_symbol_id: 0,
+            is_virtual: false,
+        });
+        let main_md_ptr = Box::into_raw(main_md);
+        self.method_descs.borrow_mut().insert(0, unsafe { make_heap_ptr(main_md_ptr as *mut c_void) });
+
+        // Call vtx_interp_run directly with our heap-allocated method descriptor
         let vrt_ptr = self.vrt_ptr;
         let env_val = self.env_val;
         let result = unsafe {
-            vtx_runtime_run_with_args(
-                vrt_ptr,
-                bc_ptr,
+            let interp = vtx_runtime_interp(vrt_ptr);
+            vtx_interp_run_direct(
+                interp,
+                main_md_ptr,
                 &[env_val] as *const Value,
                 1,
             )
@@ -498,4 +561,23 @@ extern "C" fn dispatch_callback(
     }
 
     1 // pushed 1 value
+}
+
+/// Method lookup callback for the JIT compiler.
+/// Given a method_id (= our proto_id / vtable_index), returns the
+/// VtxMethodDesc pointer so the compiler can access the bytecode.
+extern "C" fn method_lookup_callback(
+    method_id: u32,
+    user_data: *mut c_void,
+) -> *const VtxMethodDesc {
+    let rt = unsafe { &*(user_data as *const Runtime) };
+    let proto_id = method_id as i32;
+
+    // Look up the method descriptor value we created in create_method_desc
+    if let Some(md_val) = rt.get_method_desc(proto_id) {
+        if is_heap_ptr(md_val) {
+            return unsafe { heap_ptr(md_val) as *const VtxMethodDesc };
+        }
+    }
+    std::ptr::null()
 }
